@@ -1,0 +1,43 @@
+version: "3.9"
+services:
+
+  # PostgreSQL with pgvector extension
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       leadforge
+      POSTGRES_USER:     leadforge
+      POSTGRES_PASSWORD: leadforge
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U leadforge"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # LeadForge Agent API
+  agent:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://leadforge:leadforge@postgres:5432/leadforge
+      VULTR_SERVERLESS_INFERENCE_API_KEY: ${VULTR_SERVERLESS_INFERENCE_API_KEY}
+      VULTR_MODEL:  ${VULTR_MODEL:-mistralai/Mistral-7B-Instruct-v0.2}
+      SERPAPI_KEY:  ${SERPAPI_KEY}
+      PORT:         8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./..:/app
+
+volumes:
+  pgdata:
