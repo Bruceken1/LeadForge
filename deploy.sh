@@ -1,35 +1,21 @@
 #!/bin/bash
-# LeadForge Agent — Vultr VM Deployment Script
-# Run as root on a fresh Ubuntu 24.04 Vultr VM
+# LeadForge Agent — Railway Deployment
+# Railway deploys automatically from GitHub. This script is for local dev only.
+#
+# To deploy to Railway:
+#   1. Push this repo to GitHub
+#   2. Go to railway.app → New Project → Deploy from GitHub repo
+#   3. Add a PostgreSQL database service
+#   4. Set environment variables (see .env.example)
+#   Railway handles everything else via railway.toml + docker/Dockerfile
 
 set -e
-echo "🚀 Deploying LeadForge Agent..."
 
-# 1. Install Docker
-if ! command -v docker &> /dev/null; then
-  curl -fsSL https://get.docker.com | sh
-  systemctl enable docker
-fi
-
-# 2. Install Docker Compose plugin
-if ! docker compose version &> /dev/null; then
-  apt-get install -y docker-compose-plugin
-fi
-
-# 3. Create .env if missing
 if [ ! -f .env ]; then
   cp .env.example .env
-  echo "⚠️  Edit .env with your API keys before continuing"
-  echo "   nano .env"
+  echo "⚠️  Created .env — add your GROQ_API_KEY and DATABASE_URL before running"
   exit 1
 fi
 
-# 4. Start services
-docker compose -f docker/docker-compose.yml up -d --build
-
-echo ""
-echo "✅ LeadForge Agent is running!"
-echo "   API: http://$(curl -s ifconfig.me):8000"
-echo "   Health: http://$(curl -s ifconfig.me):8000/health"
-echo ""
-echo "Next: Set VITE_AGENT_API_URL=http://$(curl -s ifconfig.me):8000 in your LeadEngine .env"
+echo "Starting LeadForge Agent locally..."
+uvicorn api.main:app --reload --port "${PORT:-8000}"
