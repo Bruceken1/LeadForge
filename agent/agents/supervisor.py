@@ -70,7 +70,7 @@ def build_supervisor_graph(checkpointer=None):
             executor_node,
         ],
         model=llm_smart,
-        system_prompt=SUPERVISOR_SYSTEM,
+        prompt=SUPERVISOR_SYSTEM,
         output_mode="last_message",   # stream final message only
         add_handoff_back_messages=True,
     )
