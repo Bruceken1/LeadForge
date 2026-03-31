@@ -1,13 +1,12 @@
-# Core
 fastapi==0.115.5
 uvicorn[standard]==0.32.1
 pydantic==2.10.3
 python-dotenv==1.0.1
 
-# LangGraph + LangChain (pinned together to avoid version conflicts)
-langgraph==0.2.57
-langchain==0.3.12
-langchain-core==0.3.24
+# LangChain + LangGraph - use compatible versions
+langgraph>=0.2.57,<0.3.0
+langchain>=0.3.12,<0.4.0
+langchain-core>=0.3.25,<0.4.0
 langchain-openai==0.2.12
 langgraph-supervisor==0.0.17
 
