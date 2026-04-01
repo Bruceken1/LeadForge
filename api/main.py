@@ -225,12 +225,18 @@ async def _background_run(run_id: str, body: RunRequest):
     try:
         configure_tools(body.leadengine_api_url, body.leadengine_token, body.org_id)
 
+        import os
+        sender_email = os.environ.get("SENDER_EMAIL", "outreach@dime-solutions.co.ke")
+        sender_name  = os.environ.get("SENDER_NAME",  "Dimes Solutions")
+
         user_message = (
             f"Campaign goal: {body.campaign_goal}\n"
             f"ICP: {body.icp.industry} in {body.icp.location}, "
             f"min_rating={body.icp.min_rating}, min_reviews={body.icp.min_reviews}, "
             f"max_leads={body.max_leads}\n"
-            f"Org: {body.org_name}\n\n"
+            f"Org: {body.org_name}\n"
+            f"SENDER_EMAIL: {sender_email}\n"
+            f"SENDER_NAME: {sender_name}\n\n"
             f"START NOW: call research_agent to scrape '{body.icp.industry}' "
             f"in '{body.icp.location}', max {body.max_leads} leads."
         )
