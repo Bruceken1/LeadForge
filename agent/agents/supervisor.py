@@ -51,7 +51,6 @@ def build_supervisor_graph(checkpointer=None):
     """
     Build and compile the 5-agent LangGraph supervisor.
     Uses MemorySaver by default (in-memory checkpointing for state persistence).
-    For production, swap MemorySaver for AsyncPostgresSaver with your DB.
     """
     llm_fast  = get_fast_llm()
     llm_smart = get_smart_llm()
@@ -61,19 +60,33 @@ def build_supervisor_graph(checkpointer=None):
     personalizer_node   = create_personalization_agent(llm_smart)
     executor_node       = create_executor_agent(llm_fast)
 
-    # langgraph-supervisor builds the supervisor + subagent graph automatically
-    workflow = create_supervisor(
-        agents=[
-            research_node,
-            qualifier_node,
-            personalizer_node,
-            executor_node,
-        ],
-        model=llm_smart,
-        prompt=SUPERVISOR_SYSTEM,
-        output_mode="full_history",
-        add_handoff_back_messages=True,
-    )
+    # Build supervisor — API varies slightly between 0.0.x and 0.1.x
+    try:
+        # langgraph-supervisor 0.1.x API
+        workflow = create_supervisor(
+            agents=[
+                research_node,
+                qualifier_node,
+                personalizer_node,
+                executor_node,
+            ],
+            model=llm_smart,
+            system_prompt=SUPERVISOR_SYSTEM,
+        )
+    except TypeError:
+        # langgraph-supervisor 0.0.x API fallback
+        workflow = create_supervisor(
+            agents=[
+                research_node,
+                qualifier_node,
+                personalizer_node,
+                executor_node,
+            ],
+            model=llm_smart,
+            prompt=SUPERVISOR_SYSTEM,
+            output_mode="last_message",
+            add_handoff_back_messages=True,
+        )
 
     graph = workflow.compile(
         checkpointer=checkpointer or MemorySaver(),
