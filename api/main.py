@@ -212,12 +212,28 @@ async def _background_run(run_id: str, body: RunRequest):
                     continue
 
                 for msg in messages:
-                    content = getattr(msg, "content", "") or ""
                     msg_type = type(msg).__name__
                     agent_name = getattr(msg, "name", node_name) or node_name
+
+                    # Extract content — handle both text and tool call messages
+                    content = getattr(msg, "content", "") or ""
+
+                    # If content is a list (tool call format), extract text parts
+                    if isinstance(content, list):
+                        content = " ".join(
+                            part.get("text", "") if isinstance(part, dict) else str(part)
+                            for part in content
+                        ).strip()
+
+                    # For tool calls with no text content, build a summary
+                    tool_calls = getattr(msg, "tool_calls", []) or []
+                    if not content and tool_calls:
+                        tool_names = [tc.get("name", "unknown") for tc in tool_calls]
+                        content = f"Calling tools: {', '.join(tool_names)}"
+
                     print(f"[{run_id}]   Msg type={msg_type} name={agent_name} content_len={len(content)}")
 
-                    if content:
+                    if content and msg_type not in ("HumanMessage",):
                         await _log(run_id, agent_name, "message", {"content": str(content)[:800]})
 
                         if "HIGH_VALUE" in content or "human review" in content.lower():
