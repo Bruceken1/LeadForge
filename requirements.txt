@@ -8,6 +8,7 @@ langgraph>=0.3.5
 langchain>=0.3.12
 langchain-core>=0.3.25
 langchain-openai>=0.2.12
+langgraph-supervisor==0.0.17
 
 # Database
 asyncpg==0.30.0

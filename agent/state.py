@@ -1,6 +1,5 @@
 """
 LeadForge Agent — Shared State
-Passed through every node in the LangGraph StateGraph.
 """
 from typing import TypedDict, Annotated, Optional, List, Dict, Any
 from langgraph.graph.message import add_messages
@@ -17,23 +16,19 @@ class LeadData(TypedDict, total=False):
     industry:            Optional[str]
     rating:              Optional[float]
     reviews:             Optional[int]
-    # Research enrichments
     description:         Optional[str]
     pain_points:         Optional[List[str]]
     decision_maker:      Optional[str]
     tech_stack:          Optional[List[str]]
     recent_news:         Optional[str]
-    # Qualification
     icp_score:           Optional[int]
     icp_reasons:         Optional[List[str]]
     qualified:           Optional[bool]
     disqualify_reason:   Optional[str]
-    # Outreach content
     email_subject:       Optional[str]
     email_body:          Optional[str]
     whatsapp_body:       Optional[str]
     sequence_step:       Optional[int]
-    # Execution
     email_sent:          Optional[bool]
     whatsapp_sent:       Optional[bool]
     message_id:          Optional[str]
@@ -45,7 +40,6 @@ class AgentRunState(TypedDict):
     messages:             Annotated[list, add_messages]
     campaign_goal:        str
     icp:                  Dict[str, Any]
-    max_leads:            int                     # ← added
     leads:                List[LeadData]
     current_lead_idx:     int
     qualified_leads:      List[LeadData]
