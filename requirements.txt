@@ -3,17 +3,13 @@ uvicorn[standard]==0.32.1
 pydantic==2.10.3
 python-dotenv==1.0.1
 
-# LangGraph ecosystem — pinned for compatibility
-# langgraph-supervisor 0.1.x is built for langgraph 0.3.x
-fastapi==0.115.5
-uvicorn[standard]==0.32.1
-pydantic==2.10.3
-python-dotenv==1.0.1
-langgraph>=0.3.5,<1.2.0
+# LangGraph ecosystem - aligned versions
+# LangGraph + LangChain
+langgraph>=0.3.5
 langchain>=0.3.12
 langchain-core>=0.3.25
 langchain-openai>=0.2.12
-langgraph-supervisor>=0.0.31
+langgraph-supervisor==0.0.17
 
 # Database
 asyncpg==0.30.0

@@ -64,20 +64,71 @@ class ApproveRequest(BaseModel):
 
 # ─── Helpers ──────────────────────────────────────────────────
 async def _log(run_id: str, agent: str, event_type: str, data: dict):
-    async with _db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO agent_events (run_id, agent, event_type, data) VALUES ($1,$2,$3,$4)",
-            run_id, agent, event_type, json.dumps(data, default=str),
-        )
+    try:
+        async with _db_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO agent_events (run_id, agent, event_type, data) VALUES ($1,$2,$3,$4)",
+                run_id, agent, event_type, json.dumps(data, default=str),
+            )
+    except Exception as e:
+        print(f"[{run_id}] _log error: {e}")
+
 
 async def _set_status(run_id: str, status: str, extra: dict = {}):
-    async with _db_pool.acquire() as conn:
-        sets = ", ".join([f"{k}=${i+2}" for i, k in enumerate(extra)])
-        vals = list(extra.values())
-        if sets:
-            await conn.execute(f"UPDATE agent_runs SET status=$1, {sets}, updated_at=NOW() WHERE id=${len(vals)+2}", status, *vals, run_id)
-        else:
-            await conn.execute("UPDATE agent_runs SET status=$1, updated_at=NOW() WHERE id=$2", status, run_id)
+    try:
+        async with _db_pool.acquire() as conn:
+            if extra:
+                sets = ", ".join([f"{k}=${i+2}" for i, k in enumerate(extra)])
+                vals = list(extra.values())
+                await conn.execute(
+                    f"UPDATE agent_runs SET status=$1, {sets}, updated_at=NOW() WHERE id=${len(vals)+2}",
+                    status, *vals, run_id,
+                )
+            else:
+                await conn.execute(
+                    "UPDATE agent_runs SET status=$1, updated_at=NOW() WHERE id=$2",
+                    status, run_id,
+                )
+    except Exception as e:
+        print(f"[{run_id}] _set_status error: {e}")
+
+
+def _extract_content(msg) -> str:
+    """
+    Safely extract text content from any LangChain message type.
+    Handles plain strings, list-of-dicts (tool call format), and tool result blocks.
+    """
+    content = getattr(msg, "content", "") or ""
+
+    # Content can be a list of blocks (tool call or multipart)
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                # Text block
+                if block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+                # Tool use block — summarise rather than dump raw JSON
+                elif block.get("type") == "tool_use":
+                    name = block.get("name", "unknown_tool")
+                    inp  = block.get("input", {})
+                    parts.append(f"[calling tool: {name}({json.dumps(inp, default=str)[:200]})]")
+            else:
+                parts.append(str(block))
+        content = " ".join(p for p in parts if p).strip()
+
+    # If still empty but there are tool_calls, build a readable summary
+    if not content:
+        tool_calls = getattr(msg, "tool_calls", []) or []
+        if tool_calls:
+            summaries = []
+            for tc in tool_calls:
+                name = tc.get("name", "unknown")
+                args = tc.get("args", {})
+                summaries.append(f"{name}({json.dumps(args, default=str)[:150]})")
+            content = "Calling: " + " | ".join(summaries)
+
+    return content
 
 
 # ─── Endpoints ────────────────────────────────────────────────
@@ -111,12 +162,15 @@ async def stream_events(run_id: str):
                     yield f"data: {json.dumps({'type':'error','message':'run not found'})}\n\n"
                     return
                 rows = await conn.fetch(
-                    "SELECT id,agent,event_type,data,created_at FROM agent_events WHERE run_id=$1 AND id>$2 ORDER BY id",
+                    "SELECT id,agent,event_type,data,created_at FROM agent_events "
+                    "WHERE run_id=$1 AND id>$2 ORDER BY id",
                     run_id, last_id,
                 )
                 for r in rows:
                     last_id = r["id"]
-                    yield f"data: {json.dumps({'type':r['event_type'],'agent':r['agent'],'data':json.loads(r['data'] or '{}'),'timestamp':r['created_at'].isoformat()})}\n\n"
+                    yield (
+                        f"data: {json.dumps({'type':r['event_type'],'agent':r['agent'],'data':json.loads(r['data'] or '{}'),'timestamp':r['created_at'].isoformat()})}\n\n"
+                    )
                 status = run["status"]
                 if status in ("completed", "failed", "cancelled"):
                     yield f"data: {json.dumps({'type':'done','status':status})}\n\n"
@@ -125,17 +179,22 @@ async def stream_events(run_id: str):
                     yield f"data: {json.dumps({'type':'paused','status':status})}\n\n"
             await asyncio.sleep(1)
 
-    return StreamingResponse(gen(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/api/agent/run/{run_id}")
 async def get_run(run_id: str):
     async with _db_pool.acquire() as conn:
         run = await conn.fetchrow("SELECT * FROM agent_runs WHERE id=$1", run_id)
-        if not run: raise HTTPException(404, "Not found")
+        if not run:
+            raise HTTPException(404, "Not found")
         events = await conn.fetch(
-            "SELECT agent,event_type,data,created_at FROM agent_events WHERE run_id=$1 ORDER BY id DESC LIMIT 100",
+            "SELECT agent,event_type,data,created_at FROM agent_events "
+            "WHERE run_id=$1 ORDER BY id DESC LIMIT 100",
             run_id,
         )
     return {"run": dict(run), "events": [dict(e) for e in events]}
@@ -159,8 +218,11 @@ async def approve(body: ApproveRequest):
             body.run_id, "human", "human_decision",
             json.dumps({"approved": body.approved, "notes": body.notes}),
         )
-        new_status = "running" if body.approved else "running"
-        await conn.execute("UPDATE agent_runs SET status=$1 WHERE id=$2", new_status, body.run_id)
+        # Resume the run regardless of approval (executor skips rejected leads)
+        await conn.execute(
+            "UPDATE agent_runs SET status='running', updated_at=NOW() WHERE id=$1",
+            body.run_id,
+        )
     return {"ok": True}
 
 
@@ -176,84 +238,108 @@ async def _background_run(run_id: str, body: RunRequest):
         configure_tools(body.leadengine_api_url, body.leadengine_token, body.org_id)
 
         user_message = (
-            f"Campaign: {body.campaign_goal}\n"
-            f"ICP: {body.icp.industry} in {body.icp.location}, "
-            f"min rating {body.icp.min_rating}, max {body.max_leads} leads.\n"
-            f"Org: {body.org_name}\n\n"
-            f"Begin: scrape {body.icp.industry} businesses in {body.icp.location}, "
-            f"enrich emails, qualify against ICP, write personalised outreach, then send."
+            f"Campaign goal: {body.campaign_goal}\n"
+            f"ICP: {body.icp.industry} businesses in {body.icp.location} | "
+            f"min rating {body.icp.min_rating} | min reviews {body.icp.min_reviews} | "
+            f"max leads {body.max_leads}\n"
+            f"Org: {body.org_name} (id: {body.org_id})\n\n"
+            f"BEGIN:\n"
+            f"Step 1 — research_agent: Scrape '{body.icp.industry}' businesses in "
+            f"'{body.icp.location}', max {body.max_leads} leads. Enrich each lead "
+            f"(website scrape, contact extraction, email enrichment). Return RESEARCH REPORT.\n"
+            f"Then proceed through qualifier → personalization → executor as instructed."
         )
 
         config = {"configurable": {"thread_id": run_id}}
 
-        await _log(run_id, "supervisor", "started", {"goal": body.campaign_goal, "icp": body.icp.dict()})
+        await _log(run_id, "supervisor", "started", {
+            "goal": body.campaign_goal,
+            "icp": body.icp.dict(),
+            "max_leads": body.max_leads,
+        })
         print(f"[{run_id}] Starting agent run...")
 
         chunk_count = 0
+
         async for chunk in _agent_graph.astream(
             {"messages": [{"role": "user", "content": user_message}]},
             config=config,
             stream_mode="updates",
         ):
             chunk_count += 1
-            print(f"[{run_id}] Chunk #{chunk_count}: keys={list(chunk.keys())}")
+            print(f"[{run_id}] Chunk #{chunk_count}: nodes={list(chunk.keys())}")
 
             for node_name, node_output in chunk.items():
-                print(f"[{run_id}]   Node '{node_name}': type={type(node_output).__name__}")
-
                 if not isinstance(node_output, dict):
-                    print(f"[{run_id}]   Skipping — not a dict")
                     continue
 
                 messages = node_output.get("messages", [])
-                print(f"[{run_id}]   Messages count: {len(messages)}")
-
                 if not messages:
                     continue
 
                 for msg in messages:
-                    msg_type = type(msg).__name__
-                    agent_name = getattr(msg, "name", node_name) or node_name
+                    msg_type  = type(msg).__name__
+                    # Prefer the message's own .name over the graph node name
+                    agent_name = (getattr(msg, "name", None) or node_name).strip() or node_name
 
-                    # Extract content — handle both text and tool call messages
-                    content = getattr(msg, "content", "") or ""
+                    # Skip bare human echo messages
+                    if msg_type == "HumanMessage":
+                        continue
 
-                    # If content is a list (tool call format), extract text parts
-                    if isinstance(content, list):
-                        content = " ".join(
-                            part.get("text", "") if isinstance(part, dict) else str(part)
-                            for part in content
-                        ).strip()
+                    content = _extract_content(msg)
 
-                    # For tool calls with no text content, build a summary
-                    tool_calls = getattr(msg, "tool_calls", []) or []
-                    if not content and tool_calls:
-                        tool_names = [tc.get("name", "unknown") for tc in tool_calls]
-                        content = f"Calling tools: {', '.join(tool_names)}"
+                    print(f"[{run_id}]  {node_name}/{msg_type}/{agent_name}: {content[:120]!r}")
 
-                    print(f"[{run_id}]   Msg type={msg_type} name={agent_name} content_len={len(content)}")
+                    if not content:
+                        continue
 
-                    if content and msg_type not in ("HumanMessage",):
-                        await _log(run_id, agent_name, "message", {"content": str(content)[:800]})
+                    # Determine event type
+                    if msg_type == "ToolMessage":
+                        event_type = "tool_result"
+                    elif getattr(msg, "tool_calls", None):
+                        event_type = "tool_call"
+                    else:
+                        event_type = "message"
 
-                        if "HIGH_VALUE" in content or "human review" in content.lower():
-                            await _set_status(run_id, "paused_for_review")
-                            await _log(run_id, "supervisor", "paused", {
-                                "message": "High-value lead detected — awaiting human approval"
-                            })
+                    await _log(run_id, agent_name, event_type, {"content": content[:1500]})
 
-        print(f"[{run_id}] Graph completed. Total chunks: {chunk_count}")
+                    # Detect high-value pause trigger
+                    if "HIGH_VALUE" in content or "pause for human review" in content.lower():
+                        await _set_status(run_id, "paused_for_review")
+                        await _log(run_id, "supervisor", "paused", {
+                            "message": "High-value lead detected — awaiting human approval before sending"
+                        })
+
+                    # Detect completion markers from agent reports
+                    if any(marker in content for marker in [
+                        "EXECUTION REPORT", "CAMPAIGN COMPLETE", "campaign complete"
+                    ]):
+                        await _log(run_id, "supervisor", "progress", {
+                            "message": "Execution phase complete"
+                        })
+
+        print(f"[{run_id}] Graph finished. Total chunks: {chunk_count}")
         await _set_status(run_id, "completed")
-        await _log(run_id, "supervisor", "completed", {"message": f"All leads processed ({chunk_count} graph chunks)"})
+        await _log(run_id, "supervisor", "completed", {
+            "message": f"All agents finished ({chunk_count} graph updates processed)"
+        })
 
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
         print(f"[{run_id}] EXCEPTION: {e}\n{tb}")
         await _set_status(run_id, "failed")
-        await _log(run_id, "supervisor", "error", {"message": str(e)[:500], "traceback": tb[:1000]})
+        await _log(run_id, "supervisor", "error", {
+            "message": str(e)[:500],
+            "traceback": tb[:1500],
+        })
 
 
 if __name__ == "__main__":
-    uvicorn.run("api.main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)),
-                reload=False, workers=1)
+    uvicorn.run(
+        "api.main:app",
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 8000)),
+        reload=False,
+        workers=1,
+    )
