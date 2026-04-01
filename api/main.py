@@ -30,7 +30,7 @@ async def lifespan(app: FastAPI):
     async with _db_pool.acquire() as conn:
         await conn.execute(SCHEMA_SQL)
     _agent_graph = build_supervisor_graph()
-    print("✅ LeadForge Agent API ready — model:", os.environ.get("VULTR_MODEL", "mistralai/Mistral-7B-Instruct-v0.2"))
+    print("✅ LeadForge Agent API ready — model:", os.environ.get("GROQ_FAST_MODEL", "llama-3.1-8b-instant"))
     yield
     await _db_pool.close()
 
@@ -83,7 +83,7 @@ async def _set_status(run_id: str, status: str, extra: dict = {}):
 # ─── Endpoints ────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": os.environ.get("VULTR_MODEL", "mistralai/Mistral-7B-Instruct-v0.2")}
+    return {"status": "ok", "model": os.environ.get("GROQ_FAST_MODEL", "llama-3.1-8b-instant")}
 
 
 @app.post("/api/agent/run")

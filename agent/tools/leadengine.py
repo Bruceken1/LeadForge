@@ -3,6 +3,7 @@ LeadEngine Tools — wrap your existing Cloudflare Worker API as LangChain tools
 Agents call these to interact with LeadEngine's data layer.
 """
 import httpx
+import time
 from typing import Optional
 from langchain_core.tools import tool
 
@@ -32,15 +33,34 @@ def scrape_google_maps(keyword: str, location: str, max_results: int = 20) -> st
     Use this to find new leads matching a keyword in a target city.
     Example: keyword='restaurants', location='Mombasa, Kenya'
     """
+    # Start the scrape job
     r = httpx.post(
         f"{_API_URL}/api/scrape",
         headers=_headers(),
         json={"keyword": keyword, "location": location, "max": max_results},
         timeout=30,
     )
-    if r.status_code == 202:
-        return f"Scrape job started. Job ID: {r.json().get('jobId')}. Leads will appear in the database shortly."
-    return f"Error: {r.status_code} — {r.text[:200]}"
+
+    if r.status_code not in (200, 202):
+        return f"Error starting scrape: {r.status_code} — {r.text[:200]}"
+
+    # Poll for leads — wait up to 45 seconds for scrape to complete
+    for attempt in range(9):
+        time.sleep(5)
+        leads_r = httpx.get(
+            f"{_API_URL}/api/leads",
+            headers=_headers(),
+            params={"status": "new", "limit": max_results},
+            timeout=15,
+        )
+        if leads_r.is_success:
+            data = leads_r.json()
+            leads = data.get("leads", data) if isinstance(data, dict) else data
+            if leads and len(leads) > 0:
+                return f"Found {len(leads)} leads: {leads[:10]}"
+
+    # Return whatever we have even if empty
+    return f"Scrape completed but no leads found yet. Try get_leads() to check."
 
 
 @tool
@@ -59,7 +79,9 @@ def get_leads(status: str = "new", search: str = "", limit: int = 50) -> str:
     if r.is_success:
         data = r.json()
         leads = data.get("leads", data) if isinstance(data, dict) else data
-        return f"Found {len(leads)} leads: {leads[:10]}"  # return first 10 to avoid context overflow
+        if not leads:
+            return "No leads found in the database."
+        return f"Found {len(leads)} leads: {leads[:10]}"
     return f"Error: {r.status_code}"
 
 
