@@ -281,38 +281,7 @@ async def _background_run(run_id: str, body: RunRequest):
                         })
 
         print(f"[{run_id}] Graph finished. Total chunks: {chunk_count}")
-
-        # Parse stats from logged events to update the run counters
-        import re
-        qualified = 0
-        sent = 0
-        total = 0
-        try:
-            async with _db_pool.acquire() as conn:
-                events = await conn.fetch(
-                    "SELECT data FROM agent_events WHERE run_id=$1 ORDER BY id",
-                    run_id,
-                )
-            all_content = " ".join(
-                json.loads(e["data"]).get("content", "") for e in events
-            ).lower()
-            q_match = re.search(r"qualified[:\s]+(\d+)", all_content)
-            if q_match:
-                qualified = int(q_match.group(1))
-            s_match = re.search(r"emails?\s+sent[:\s]+(\d+)", all_content)
-            if s_match:
-                sent = int(s_match.group(1))
-            t_match = re.search(r"(?:total\s+)?leads?\s+found[:\s]+(\d+)", all_content)
-            if t_match:
-                total = int(t_match.group(1))
-        except Exception as stats_err:
-            print(f"[{run_id}] Stats parse error (non-fatal): {stats_err}")
-
-        await _set_status(run_id, "completed", {
-            "total_leads": total,
-            "qualified":   qualified,
-            "sent":        sent,
-        })
+        await _set_status(run_id, "completed")
         await _log(run_id, "supervisor", "completed", {
             "message": f"All agents finished ({chunk_count} graph updates processed)"
         })

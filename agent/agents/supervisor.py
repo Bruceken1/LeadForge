@@ -25,22 +25,14 @@ AGENTS:
 STRICT ORDER — do not skip steps:
 1. Call research_agent: "Scrape {industry} in {location}, max {max} leads. Enrich emails. Return RESEARCH REPORT."
 2. Call qualifier_agent: "Score all leads against ICP: {icp}. Return QUALIFICATION SUMMARY."
-3. Call personalization_agent with all QUALIFIED leads including their lead_id, name, email, phone, city, industry, rating, and description. It will return EMAIL and WHATSAPP content for each.
-4. Call executor_agent with the COMPLETE details for each lead: lead_id, name, email, phone, email_subject, email_body, and whatsapp_message from the personalizer output. The executor must ACTUALLY CALL send_email_to_lead() and send_whatsapp_to_lead() for each lead — not just report that it did.
+3. Call personalization_agent: "Write outreach for each QUALIFIED lead. Return outreach packages."
+4. Call executor_agent: "Send email and WhatsApp to all qualified leads. Return EXECUTION REPORT."
 5. Summarise results.
 
 RULES:
 - ICP score >=85 AND reviews >100 AND has email → flag HIGH_VALUE, pause for human review
 - On agent error → retry once, then skip that lead
 - Always call the next agent immediately after the previous one completes
-
-ANTI-FABRICATION RULES (MANDATORY — never break these):
-- NEVER invent, assume, or fabricate any data. Every piece of information you use must come from a tool call result.
-- NEVER write a summary, report, or status update before calling the required tools.
-- If a tool returns an error, report the error exactly. Do not pretend it succeeded.
-- If you do not have a required piece of data (e.g. email address, lead_id), call the appropriate tool to get it. Do not guess.
-- A Message ID or SID in the tool response is proof of a real action. No ID = nothing happened.
-- If you cannot complete a step because data is missing, say exactly what is missing and stop. Do not fabricate a workaround.
 """
 
 

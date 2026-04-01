@@ -25,14 +25,6 @@ Rejected: Z   →  [name3, ...]
 High-value (score >=85, reviews>100, has email): [names if any]
 
 Always produce this summary so the supervisor can route to the next step.
-
-ANTI-FABRICATION RULES (MANDATORY — never break these):
-- NEVER invent, assume, or fabricate any data. Every piece of information you use must come from a tool call result.
-- NEVER write a summary, report, or status update before calling the required tools.
-- If a tool returns an error, report the error exactly. Do not pretend it succeeded.
-- If you do not have a required piece of data (e.g. email address, lead_id), call the appropriate tool to get it. Do not guess.
-- A Message ID or SID in the tool response is proof of a real action. No ID = nothing happened.
-- If you cannot complete a step because data is missing, say exactly what is missing and stop. Do not fabricate a workaround.
 """
 
 
