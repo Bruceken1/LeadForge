@@ -187,36 +187,55 @@ async def _background_run(run_id: str, body: RunRequest):
         config = {"configurable": {"thread_id": run_id}}
 
         await _log(run_id, "supervisor", "started", {"goal": body.campaign_goal, "icp": body.icp.dict()})
+        print(f"[{run_id}] Starting agent run...")
 
+        chunk_count = 0
         async for chunk in _agent_graph.astream(
             {"messages": [{"role": "user", "content": user_message}]},
             config=config,
             stream_mode="updates",
         ):
+            chunk_count += 1
+            print(f"[{run_id}] Chunk #{chunk_count}: keys={list(chunk.keys())}")
+
             for node_name, node_output in chunk.items():
-                if not isinstance(node_output, dict): continue
+                print(f"[{run_id}]   Node '{node_name}': type={type(node_output).__name__}")
+
+                if not isinstance(node_output, dict):
+                    print(f"[{run_id}]   Skipping — not a dict")
+                    continue
+
                 messages = node_output.get("messages", [])
-                if not messages: continue
-                last = messages[-1]
-                content = getattr(last, "content", "") or ""
-                if not content: continue
-                agent_name = getattr(last, "name", node_name) or node_name
-                await _log(run_id, agent_name, "message", {"content": str(content)[:800]})
+                print(f"[{run_id}]   Messages count: {len(messages)}")
 
-                # Detect human review signal in message content
-                if "HIGH_VALUE" in content or "human review" in content.lower() or "human_review" in content:
-                    await _set_status(run_id, "paused_for_review")
-                    await _log(run_id, "supervisor", "paused", {
-                        "message": "High-value lead detected — awaiting human approval"
-                    })
+                if not messages:
+                    continue
 
+                for msg in messages:
+                    content = getattr(msg, "content", "") or ""
+                    msg_type = type(msg).__name__
+                    agent_name = getattr(msg, "name", node_name) or node_name
+                    print(f"[{run_id}]   Msg type={msg_type} name={agent_name} content_len={len(content)}")
+
+                    if content:
+                        await _log(run_id, agent_name, "message", {"content": str(content)[:800]})
+
+                        if "HIGH_VALUE" in content or "human review" in content.lower():
+                            await _set_status(run_id, "paused_for_review")
+                            await _log(run_id, "supervisor", "paused", {
+                                "message": "High-value lead detected — awaiting human approval"
+                            })
+
+        print(f"[{run_id}] Graph completed. Total chunks: {chunk_count}")
         await _set_status(run_id, "completed")
-        await _log(run_id, "supervisor", "completed", {"message": "All leads processed"})
+        await _log(run_id, "supervisor", "completed", {"message": f"All leads processed ({chunk_count} graph chunks)"})
 
     except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        print(f"[{run_id}] EXCEPTION: {e}\n{tb}")
         await _set_status(run_id, "failed")
-        await _log(run_id, "supervisor", "error", {"message": str(e)[:500]})
-        import traceback; traceback.print_exc()
+        await _log(run_id, "supervisor", "error", {"message": str(e)[:500], "traceback": tb[:1000]})
 
 
 if __name__ == "__main__":
