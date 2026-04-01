@@ -145,6 +145,11 @@ def update_lead_status(lead_id: int, status: str, notes: str = "") -> str:
     if not _API_URL:
         return "Error: LeadEngine tools not configured."
 
+    try:
+        lead_id = int(lead_id)
+    except (ValueError, TypeError):
+        return f"Invalid lead_id '{lead_id}' — must be a number from get_leads results."
+
     valid_statuses = {"new", "contacted", "replied", "meeting", "closed", "bounced", "unsubscribed"}
     if status not in valid_statuses:
         return f"Invalid status '{status}'. Must be one of: {', '.join(sorted(valid_statuses))}"
@@ -175,9 +180,15 @@ def enrich_lead_email(lead_id: int) -> str:
     Searches the lead's website domain for decision-maker email addresses.
     Call this for any lead that has a website but no email yet.
     Returns the found email and enrichment status.
+    lead_id must be an integer — the numeric id field from get_leads results.
     """
     if not _API_URL:
         return "Error: LeadEngine tools not configured."
+
+    try:
+        lead_id = int(lead_id)
+    except (ValueError, TypeError):
+        return f"Invalid lead_id '{lead_id}' — must be a number from get_leads results."
 
     try:
         r = httpx.post(
