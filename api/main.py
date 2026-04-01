@@ -1,10 +1,9 @@
 """
 LeadForge Agent API — FastAPI + Server-Sent Events
-Deployed on Vultr VM. Connects to LeadEngine Cloudflare Worker.
 """
 import asyncio, json, os, uuid
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Optional
 
 import asyncpg, uvicorn
 from fastapi import FastAPI, HTTPException
@@ -30,22 +29,29 @@ async def lifespan(app: FastAPI):
     async with _db_pool.acquire() as conn:
         await conn.execute(SCHEMA_SQL)
     _agent_graph = build_supervisor_graph()
-    print("✅ LeadForge Agent API ready — model:", os.environ.get("GROQ_FAST_MODEL", "llama-3.1-8b-instant"))
+
+    # ── confirm which supervisor is loaded ──────────────────
+    graph_nodes = list(_agent_graph.nodes.keys()) if hasattr(_agent_graph, "nodes") else ["unknown"]
+    print("✅ LeadForge ready")
+    print(f"   supervisor type : StateGraph (sequential pipeline)")
+    print(f"   graph nodes     : {graph_nodes}")
+    print(f"   fast model      : {os.environ.get('GROQ_FAST_MODEL', 'llama-3.1-8b-instant')}")
+    print(f"   smart model     : {os.environ.get('GROQ_SMART_MODEL', 'llama-3.3-70b-versatile')}")
     yield
     await _db_pool.close()
 
 
-app = FastAPI(title="LeadForge Agent API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="LeadForge Agent API", version="2.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
 # ─── Schemas ──────────────────────────────────────────────────
 class ICP(BaseModel):
-    industry:    str   = "restaurants"
-    location:    str   = "Nairobi, Kenya"
-    min_rating:  float = 3.0
+    industry:    str       = "restaurants"
+    location:    str       = "Nairobi, Kenya"
+    min_rating:  float     = 3.0
     keywords:    list[str] = []
-    min_reviews: int   = 5
+    min_reviews: int       = 5
 
 class RunRequest(BaseModel):
     campaign_goal:      str
@@ -57,9 +63,9 @@ class RunRequest(BaseModel):
     max_leads:          int = 20
 
 class ApproveRequest(BaseModel):
-    run_id:    str
-    approved:  bool
-    notes:     str = ""
+    run_id:   str
+    approved: bool
+    notes:    str = ""
 
 
 # ─── Helpers ──────────────────────────────────────────────────
@@ -93,48 +99,41 @@ async def _set_status(run_id: str, status: str, extra: dict = {}):
         print(f"[{run_id}] _set_status error: {e}")
 
 
-def _extract_content(msg) -> str:
-    """
-    Safely extract text content from any LangChain message type.
-    Handles plain strings, list-of-dicts (tool call format), and tool result blocks.
-    """
+def _extract_content(msg: Any) -> str:
     content = getattr(msg, "content", "") or ""
-
-    # Content can be a list of blocks (tool call or multipart)
     if isinstance(content, list):
         parts = []
         for block in content:
             if isinstance(block, dict):
-                # Text block
                 if block.get("type") == "text":
                     parts.append(block.get("text", ""))
-                # Tool use block — summarise rather than dump raw JSON
                 elif block.get("type") == "tool_use":
-                    name = block.get("name", "unknown_tool")
-                    inp  = block.get("input", {})
-                    parts.append(f"[calling tool: {name}({json.dumps(inp, default=str)[:200]})]")
+                    parts.append(f"[tool:{block.get('name')}]")
             else:
                 parts.append(str(block))
         content = " ".join(p for p in parts if p).strip()
-
-    # If still empty but there are tool_calls, build a readable summary
     if not content:
         tool_calls = getattr(msg, "tool_calls", []) or []
         if tool_calls:
-            summaries = []
-            for tc in tool_calls:
-                name = tc.get("name", "unknown")
-                args = tc.get("args", {})
-                summaries.append(f"{name}({json.dumps(args, default=str)[:150]})")
-            content = "Calling: " + " | ".join(summaries)
-
+            content = "Calling: " + " | ".join(
+                f"{tc.get('name')}({json.dumps(tc.get('args',{}), default=str)[:60]})"
+                for tc in tool_calls
+            )
     return content
 
 
 # ─── Endpoints ────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": os.environ.get("GROQ_FAST_MODEL", "llama-3.1-8b-instant")}
+    graph_nodes = list(_agent_graph.nodes.keys()) if _agent_graph and hasattr(_agent_graph, "nodes") else []
+    return {
+        "status":      "ok",
+        "version":     "2.0.0",
+        "supervisor":  "StateGraph-sequential",
+        "graph_nodes": graph_nodes,
+        "fast_model":  os.environ.get("GROQ_FAST_MODEL", "llama-3.1-8b-instant"),
+        "smart_model": os.environ.get("GROQ_SMART_MODEL", "llama-3.3-70b-versatile"),
+    }
 
 
 @app.post("/api/agent/run")
@@ -152,7 +151,6 @@ async def start_run(body: RunRequest):
 
 @app.get("/api/agent/stream/{run_id}")
 async def stream_events(run_id: str):
-    """Server-Sent Events — frontend connects here for live agent activity."""
     async def gen() -> AsyncGenerator[str, None]:
         last_id = 0
         while True:
@@ -168,9 +166,7 @@ async def stream_events(run_id: str):
                 )
                 for r in rows:
                     last_id = r["id"]
-                    yield (
-                        f"data: {json.dumps({'type':r['event_type'],'agent':r['agent'],'data':json.loads(r['data'] or '{}'),'timestamp':r['created_at'].isoformat()})}\n\n"
-                    )
+                    yield f"data: {json.dumps({'type':r['event_type'],'agent':r['agent'],'data':json.loads(r['data'] or '{}'),'timestamp':r['created_at'].isoformat()})}\n\n"
                 status = run["status"]
                 if status in ("completed", "failed", "cancelled"):
                     yield f"data: {json.dumps({'type':'done','status':status})}\n\n"
@@ -218,7 +214,6 @@ async def approve(body: ApproveRequest):
             body.run_id, "human", "human_decision",
             json.dumps({"approved": body.approved, "notes": body.notes}),
         )
-        # Resume the run regardless of approval (executor skips rejected leads)
         await conn.execute(
             "UPDATE agent_runs SET status='running', updated_at=NOW() WHERE id=$1",
             body.run_id,
@@ -237,100 +232,89 @@ async def _background_run(run_id: str, body: RunRequest):
     try:
         configure_tools(body.leadengine_api_url, body.leadengine_token, body.org_id)
 
-        user_message = (
-            f"Campaign goal: {body.campaign_goal}\n"
-            f"ICP: {body.icp.industry} businesses in {body.icp.location} | "
-            f"min rating {body.icp.min_rating} | min reviews {body.icp.min_reviews} | "
-            f"max leads {body.max_leads}\n"
-            f"Org: {body.org_name} (id: {body.org_id})\n\n"
-            f"BEGIN:\n"
-            f"Step 1 — research_agent: Scrape '{body.icp.industry}' businesses in "
-            f"'{body.icp.location}', max {body.max_leads} leads. Enrich each lead "
-            f"(website scrape, contact extraction, email enrichment). Return RESEARCH REPORT.\n"
-            f"Then proceed through qualifier → personalization → executor as instructed."
-        )
+        await _log(run_id, "supervisor", "started", {
+            "goal":      body.campaign_goal,
+            "icp":       body.icp.dict(),
+            "max_leads": body.max_leads,
+        })
+        print(f"[{run_id}] ▶ Starting sequential agent pipeline")
+
+        initial_state = {
+            "messages":            [],
+            "campaign_goal":       body.campaign_goal,
+            "icp":                 body.icp.dict(),
+            "max_leads":           body.max_leads,
+            "leads":               [],
+            "current_lead_idx":    0,
+            "qualified_leads":     [],
+            "rejected_leads":      [],
+            "sent_count":          0,
+            "next_agent":          None,
+            "human_review_needed": False,
+            "error":               None,
+            "org_id":              body.org_id,
+            "org_name":            body.org_name,
+            "run_id":              run_id,
+            "leadengine_api_url":  body.leadengine_api_url,
+            "leadengine_token":    body.leadengine_token,
+        }
 
         config = {"configurable": {"thread_id": run_id}}
 
-        await _log(run_id, "supervisor", "started", {
-            "goal": body.campaign_goal,
-            "icp": body.icp.dict(),
-            "max_leads": body.max_leads,
-        })
-        print(f"[{run_id}] Starting agent run...")
+        node_order = ["research", "qualify", "personalize", "execute"]
+        completed_nodes = []
 
-        chunk_count = 0
-
-        async for chunk in _agent_graph.astream(
-            {"messages": [{"role": "user", "content": user_message}]},
-            config=config,
-            stream_mode="updates",
-        ):
-            chunk_count += 1
-            print(f"[{run_id}] Chunk #{chunk_count}: nodes={list(chunk.keys())}")
-
+        async for chunk in _agent_graph.astream(initial_state, config=config, stream_mode="updates"):
             for node_name, node_output in chunk.items():
+                completed_nodes.append(node_name)
+                print(f"[{run_id}] ✓ Node '{node_name}' finished ({len(completed_nodes)}/{len(node_order)})")
+
                 if not isinstance(node_output, dict):
                     continue
 
                 messages = node_output.get("messages", [])
-                if not messages:
-                    continue
-
                 for msg in messages:
-                    msg_type  = type(msg).__name__
-                    # Prefer the message's own .name over the graph node name
-                    agent_name = (getattr(msg, "name", None) or node_name).strip() or node_name
+                    msg_type   = type(msg).__name__
+                    agent_name = getattr(msg, "name", None) or node_name
+                    content    = _extract_content(msg)
 
-                    # Skip bare human echo messages
-                    if msg_type == "HumanMessage":
+                    print(f"[{run_id}]   {agent_name} [{msg_type}]: {content[:200]!r}")
+
+                    if not content or msg_type == "HumanMessage":
                         continue
 
-                    content = _extract_content(msg)
+                    await _log(run_id, agent_name, "message", {"content": content[:2000]})
 
-                    print(f"[{run_id}]  {node_name}/{msg_type}/{agent_name}: {content[:120]!r}")
-
-                    if not content:
-                        continue
-
-                    # Determine event type
-                    if msg_type == "ToolMessage":
-                        event_type = "tool_result"
-                    elif getattr(msg, "tool_calls", None):
-                        event_type = "tool_call"
-                    else:
-                        event_type = "message"
-
-                    await _log(run_id, agent_name, event_type, {"content": content[:1500]})
-
-                    # Detect high-value pause trigger
                     if "HIGH_VALUE" in content or "pause for human review" in content.lower():
                         await _set_status(run_id, "paused_for_review")
                         await _log(run_id, "supervisor", "paused", {
-                            "message": "High-value lead detected — awaiting human approval before sending"
+                            "message": "High-value lead flagged — awaiting human approval"
                         })
 
-                    # Detect completion markers from agent reports
-                    if any(marker in content for marker in [
-                        "EXECUTION REPORT", "CAMPAIGN COMPLETE", "campaign complete"
-                    ]):
-                        await _log(run_id, "supervisor", "progress", {
-                            "message": "Execution phase complete"
-                        })
+                milestone_labels = {
+                    "research":   "✅ Research complete — leads found and enriched",
+                    "qualify":    "✅ Qualification complete — leads scored",
+                    "personalize":"✅ Personalization complete — outreach written",
+                    "execute":    "✅ Execution complete — messages sent",
+                }
+                if node_name in milestone_labels:
+                    await _log(run_id, "supervisor", "progress", {
+                        "message": milestone_labels[node_name]
+                    })
 
-        print(f"[{run_id}] Graph finished. Total chunks: {chunk_count}")
+        print(f"[{run_id}] ■ Pipeline done. Nodes completed: {completed_nodes}")
         await _set_status(run_id, "completed")
         await _log(run_id, "supervisor", "completed", {
-            "message": f"All agents finished ({chunk_count} graph updates processed)"
+            "message": f"Campaign complete. Stages run: {', '.join(completed_nodes)}"
         })
 
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
-        print(f"[{run_id}] EXCEPTION: {e}\n{tb}")
+        print(f"[{run_id}] ✗ EXCEPTION: {e}\n{tb}")
         await _set_status(run_id, "failed")
         await _log(run_id, "supervisor", "error", {
-            "message": str(e)[:500],
+            "message":   str(e)[:500],
             "traceback": tb[:1500],
         })
 

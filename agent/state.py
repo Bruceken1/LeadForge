@@ -1,6 +1,6 @@
 """
 LeadForge Agent — Shared State
-All 5 agents read/write this TypedDict via LangGraph's state machine.
+Passed through every node in the LangGraph StateGraph.
 """
 from typing import TypedDict, Annotated, Optional, List, Dict, Any
 from langgraph.graph.message import add_messages
@@ -45,6 +45,7 @@ class AgentRunState(TypedDict):
     messages:             Annotated[list, add_messages]
     campaign_goal:        str
     icp:                  Dict[str, Any]
+    max_leads:            int                     # ← added
     leads:                List[LeadData]
     current_lead_idx:     int
     qualified_leads:      List[LeadData]
