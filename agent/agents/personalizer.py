@@ -1,135 +1,219 @@
 """
-Personalization Agent — Writes real, personalized outreach content per lead.
+Personalization & Content Agent — Generates hyper-personalized outreach.
+Uses research insights and local context to craft messages.
 """
 from langgraph.prebuilt import create_react_agent
 from langchain_core.tools import tool
 from agent.llm import get_smart_llm
 
 PERSONALIZATION_SYSTEM = """
-You are the Personalization Agent for LeadForge. You write personalized outreach content
-for East African businesses. You receive a list of QUALIFIED LEADS from the qualifier.
+You are the Personalization Agent for LeadForge. You write outreach messages
+for East African businesses that feel genuinely researched and human.
 
-MANDATORY WORKFLOW for each qualified lead:
-1. Call get_local_context(city, industry) to get cultural/business context.
-2. Call generate_outreach_brief(company_name, city, industry, rating, description,
-   pain_points, service_offered) to get a writing brief.
-3. Using the brief, write the actual messages (do NOT just copy the brief).
-4. Return the outreach package in the EXACT format below.
+WORKFLOW:
+1. Call get_local_context(city, industry) to load the East African business context.
+2. Call generate_email_sequence(...) with all lead details — this returns a
+   structured template you MUST expand into real, personalized content.
+3. Return the FULL outreach package for EACH lead in this exact format:
 
-OUTPUT FORMAT — repeat this block for EVERY qualified lead:
+=== OUTREACH: [Company Name] ===
+EMAIL SUBJECT: [subject line]
+EMAIL BODY:
+[full email body]
 
-=== OUTREACH PACKAGE ===
-lead_id: [integer from qualifier — REQUIRED]
-name: [company name]
-email: [email address]
-phone: [phone number or 'none']
-EMAIL_SUBJECT: [subject line — max 60 chars]
-EMAIL_BODY:
-[80-120 word email. Professional. One specific observation about their business.
-One clear CTA. No clichés. Signed with sender name.]
 WHATSAPP:
-[60 word max. Conversational. One open question. No sales pitch.]
-FOLLOW_UP_SUBJECT: [subject]
-FOLLOW_UP_BODY:
-[60-80 words. Different angle from first email. Reference previous contact.]
-=======================
+[whatsapp message]
+
+FOLLOW-UP SUBJECT: [subject]
+FOLLOW-UP BODY:
+[follow-up email body]
+===============================
 
 RULES:
-- NEVER use: "I hope this finds you well", "synergy", "leverage", "circle back", "game-changer"
-- ALWAYS reference something specific from their business (rating, city, industry, description)
-- Email: 80-120 words, one CTA, professional closing
-- WhatsApp: max 60 words, casual, end with a question
-- Law/healthcare/corporate = formal English; restaurants/retail/hotels = warm and casual
-- Kenya/Tanzania: WhatsApp can start with "Habari" for local businesses
-- After all leads done: output "PERSONALIZATION COMPLETE: X packages generated"
+- NEVER use: "I hope this finds you well", "synergy", "leverage", "circle back"
+- ALWAYS mention something specific about THEIR business (city, rating, industry)
+- Email body: 80-120 words. One clear CTA. No buzzwords.
+- WhatsApp: 60 words max. Casual, conversational. One question to invite response.
+- Follow-up: 60-80 words. Different angle. Reference first outreach.
+- Match formality to industry: law/healthcare = formal, restaurants/retail = casual
+- For Kenyan/Tanzanian SMEs, starting WhatsApp with "Habari" is appreciated
 
-ANTI-FABRICATION RULES (MANDATORY):
-- NEVER invent a lead_id. Use only the integer id from the qualifier's output.
-- NEVER fabricate an email address. Use only what the qualifier provided.
-- If a lead has no email, still write the content but set email: 'not available'.
-- Every message must reference something real about the business from the research/qualifier data.
+After all leads are processed, output:
+PERSONALIZATION SUMMARY: Generated outreach for X leads.
+
+ANTI-FABRICATION RULES (MANDATORY — never break these):
+- NEVER invent, assume, or fabricate any data. Every piece of information you use must come from a tool call result.
+- NEVER write a summary, report, or status update before calling the required tools.
+- If a tool returns an error, report the error exactly. Do not pretend it succeeded.
+- If you do not have a required piece of data (e.g. email address, lead_id), call the appropriate tool to get it. Do not guess.
+- A Message ID or SID in the tool response is proof of a real action. No ID = nothing happened.
+- If you cannot complete a step because data is missing, say exactly what is missing and stop. Do not fabricate a workaround.
 """
 
 
 @tool
-def generate_outreach_brief(
+def generate_email_sequence(
     company_name: str,
     city: str,
     industry: str,
     rating: float,
     description: str,
     pain_points: str,
+    sender_name: str,
     service_offered: str,
+    similar_success: str = "",
 ) -> str:
     """
-    Generate a structured writing brief for personalizing outreach to a lead.
-    Returns tone guidance, messaging angles, and CTA recommendations.
+    Build a structured outreach brief for a lead.
+    Returns a detailed brief the agent uses to write the actual messages —
+    including suggested angles, tone guidance, and a CTA recommendation.
     """
-    formal = any(w in industry.lower() for w in ["law", "legal", "healthcare", "hospital", "corporate", "finance"])
-    sme = any(w in industry.lower() for w in ["restaurant", "cafe", "hotel", "retail", "shop", "salon"])
+    # Derive tone from industry
+    formal_industries = ["law", "legal", "healthcare", "hospital", "clinic", "corporate", "finance", "bank"]
+    is_formal = any(ind in industry.lower() for ind in formal_industries)
+    tone = "formal and professional" if is_formal else "warm, casual and conversational"
 
-    tone = "formal and professional — no contractions, precise language" if formal else "warm and conversational — contractions OK"
-    channel = "Email first (formal), then WhatsApp" if formal else "WhatsApp first (higher open rate), then email"
+    # Derive primary channel recommendation
+    sme_industries = ["restaurant", "cafe", "hotel", "retail", "shop", "salon", "bar"]
+    is_sme = any(ind in industry.lower() for ind in sme_industries)
+    primary_channel = "WhatsApp first, then email" if is_sme else "Email first, then WhatsApp"
 
+    # Rating-aware messaging angle
     if rating >= 4.2:
-        angle = f"Their {rating}★ reputation is strong — lead with amplifying visibility and growth"
+        angle = f"They have a strong {rating}★ reputation — lead with amplifying their visibility/growth"
     elif rating >= 3.5:
-        angle = f"Solid {rating}★ — lead with standing out in a competitive {industry} market"
+        angle = f"Solid {rating}★ rating — lead with helping them stand out in a competitive market"
     else:
-        angle = "Focus on the opportunity and value — avoid mentioning rating"
+        angle = "Avoid mentioning rating — focus entirely on the opportunity and value offered"
 
-    pain = pain_points if pain_points else "online visibility, lead generation, client acquisition"
-    swahili = 'Consider opening WhatsApp with "Habari" for local warmth.' if city.lower() in ["nairobi", "mombasa", "kisumu", "kampala", "dar es salaam"] else ""
+    # Pain points context
+    pain_str = pain_points if pain_points else "standard SME pain points (online visibility, lead generation, efficiency)"
+
+    # Success pattern context
+    success_note = (
+        f"Similar past success: {similar_success[:200]}" if similar_success
+        else "No similar past success on record — write fresh"
+    )
+
+    swahili_opener = ""
+    if city.lower() in ["mombasa", "dar es salaam", "zanzibar", "nairobi", "kisumu", "kampala"]:
+        swahili_opener = 'Consider opening WhatsApp with "Habari [Name]" for a warm local touch.'
 
     return (
-        f"BRIEF FOR: {company_name} | {industry} | {city} | {rating}★\n"
-        f"Description: {description[:300] if description else 'not available'}\n"
-        f"Pain points: {pain}\n"
-        f"Service: {service_offered}\n"
+        f"OUTREACH BRIEF FOR: {company_name}\n"
+        f"Industry: {industry} | City: {city} | Rating: {rating}★\n"
+        f"Description: {description[:300] if description else 'Not available'}\n"
+        f"Pain points to address: {pain_str}\n"
+        f"Service to pitch: {service_offered}\n"
+        f"Sender name: {sender_name}\n"
         f"Tone: {tone}\n"
-        f"Channel order: {channel}\n"
-        f"Angle: {angle}\n"
-        f"{swahili}\n"
-        f"CTA: Request a 15-min call or WhatsApp chat — low friction\n"
-        f"Now write: (1) email subject + body, (2) WhatsApp message, (3) follow-up subject + body."
+        f"Primary channel: {primary_channel}\n"
+        f"Messaging angle: {angle}\n"
+        f"{swahili_opener}\n"
+        f"CTA recommendation: Request a 15-min call or WhatsApp chat — low friction\n"
+        f"{success_note}\n"
+        f"\nNow write: (1) cold email subject + body, "
+        f"(2) WhatsApp message, (3) follow-up email subject + body."
     )
 
 
 @tool
 def get_local_context(city: str, industry: str) -> str:
     """
-    Get East African business and cultural context for a city and industry.
-    Use this before writing any outreach to ensure cultural fit.
+    Get East African business context for a city and industry.
+    Returns tone, cultural, and communication guidance for the target market.
     """
-    city_ctx = {
-        "nairobi": "Business hub, fast-paced, tech-savvy. CBD is formal; Westlands/Karen casual. Decision makers reachable on LinkedIn and WhatsApp.",
-        "mombasa": "Coastal, tourism-heavy. Mix of Swahili and English. Relationship-first — small talk expected. WhatsApp dominant. 'Habari' well-received.",
-        "kisumu": "Growing SME scene, Lake Victoria commerce. Warm and community-oriented. Owners hands-on and reachable.",
-        "kampala": "Ugandan capital, entrepreneurial mix of formal/informal. English primary, Luganda greetings appreciated. Strong WhatsApp culture.",
-        "dar es salaam": "Tanzanian hub. Swahili primary, English in formal business. Relationship-first — do not rush to pitch.",
-        "kigali": "Rwanda capital, organised. Formal English. Tech-forward and entrepreneurial.",
+    city_context = {
+        "nairobi": (
+            "Business hub, fast-paced, tech-savvy. CBD is formal; Westlands/Karen/Kilimani "
+            "are more casual and startup-friendly. Decision makers are often accessible on LinkedIn and WhatsApp."
+        ),
+        "mombasa": (
+            "Tourism and trade hub, coastal culture. Mix of Swahili and English in business. "
+            "Relationship-oriented — small talk before business is expected. "
+            "WhatsApp is the dominant channel. 'Habari' (Swahili greeting) is well-received."
+        ),
+        "kisumu": (
+            "Growing city, vibrant SME scene, Lake Victoria commerce. "
+            "Warm and community-oriented culture. Owners are usually hands-on and reachable."
+        ),
+        "kampala": (
+            "Ugandan capital, entrepreneurial, mix of formal and informal business culture. "
+            "English is primary, Luganda greetings appreciated. Strong WhatsApp culture."
+        ),
+        "dar es salaam": (
+            "Tanzanian commercial hub. Swahili is primary, English used in formal business. "
+            "Relationship-first culture — do not rush to the pitch. Patient, warm tone required."
+        ),
+        "zanzibar": (
+            "Tourism-heavy economy, hospitality and retail dominant. "
+            "Swahili culture, relaxed pace, very relationship-oriented."
+        ),
+        "kigali": (
+            "Rwanda's capital, clean and organized business environment. "
+            "Formal English communication expected. Tech-forward, entrepreneurial."
+        ),
     }
-    ind_ctx = {
-        "law": "Very formal, referral-based. Pain: client acquisition, online rep, document management. Use precise, professional language.",
-        "legal": "Same as law — formal, referral-driven. Emphasize credibility and confidentiality.",
-        "restaurant": "Owner-operated. Pain: visibility, delivery, reviews. Keep it personal and brief. No jargon.",
-        "hotel": "Pain: direct bookings vs OTA, occupancy. Formal tone. Emphasize ROI.",
-        "real estate": "Commission-driven. Pain: lead gen, listing visibility. Always looking for more clients.",
-        "healthcare": "Trust and reputation critical. Formal tone. Focus on patient experience.",
-        "retail": "Owner-operated. Pain: foot traffic, online presence. Direct, show quick wins.",
-        "school": "Principal or bursar decides. Formal. Pain: parent comms, enrollment.",
+
+    industry_context = {
+        "restaurants": (
+            "Usually family-owned or owner-operated. Decision maker = owner or manager. "
+            "Pain points: online visibility, delivery partnerships, review management, slow seasons. "
+            "Value word-of-mouth. Avoid jargon. Keep it personal and brief."
+        ),
+        "hotels": (
+            "Pain points: direct bookings vs OTA commission, occupancy fluctuations, digital marketing. "
+            "Decision maker = GM or owner. Formal tone. Emphasize ROI and occupancy rate improvement."
+        ),
+        "law": (
+            "Very formal, referral-based. Partnership decisions are collective. "
+            "Pain points: client acquisition, online reputation, document management. "
+            "Use precise, professional language. Avoid any sales-y phrases."
+        ),
+        "legal": (
+            "Same as law firms — formal, referral-driven. Emphasize credibility and confidentiality."
+        ),
+        "real estate": (
+            "Commission-driven. Pain points: lead generation, listing visibility, CRM. "
+            "Decision maker = director or senior agent. Always looking for more listings and buyers."
+        ),
+        "healthcare": (
+            "Patient trust and reputation are critical. Regulatory context matters. "
+            "Decision maker = practice owner or administrator. Formal tone. Focus on patient experience."
+        ),
+        "retail": (
+            "Owner-operated usually. Pain points: foot traffic, online presence, inventory. "
+            "Decision maker = shop owner. Casual, direct tone. Show quick wins."
+        ),
+        "school": (
+            "Decision maker = principal or bursar. Formal tone. "
+            "Pain points: parent communication, enrollment, administration efficiency."
+        ),
+        "ngo": (
+            "Mission-driven. Pain points: donor communication, volunteer management, reporting. "
+            "Emphasize impact and efficiency gains over revenue."
+        ),
     }
+
     city_lower = city.lower()
-    ind_lower = industry.lower()
-    c = next((v for k, v in city_ctx.items() if k in city_lower), "East African context: warm, relationship-first communication.")
-    i = next((v for k, v in ind_ctx.items() if k in ind_lower), "SME — direct value proposition, moderate tone.")
-    return f"CITY ({city}): {c}\nINDUSTRY ({industry}): {i}"
+    industry_lower = industry.lower()
+
+    city_ctx = next(
+        (v for k, v in city_context.items() if k in city_lower),
+        "East African business context applies — warm, relationship-first communication recommended."
+    )
+    industry_ctx = next(
+        (v for k, v in industry_context.items() if k in industry_lower),
+        "SME typical of East African market — direct value proposition, casual-to-moderate tone."
+    )
+
+    return f"CITY CONTEXT ({city}):\n{city_ctx}\n\nINDUSTRY CONTEXT ({industry}):\n{industry_ctx}"
 
 
 def create_personalization_agent(llm=None):
     return create_react_agent(
         model=llm or get_smart_llm(),
-        tools=[generate_outreach_brief, get_local_context],
+        tools=[generate_email_sequence, get_local_context],
         name="personalization_agent",
         prompt=PERSONALIZATION_SYSTEM,
     )

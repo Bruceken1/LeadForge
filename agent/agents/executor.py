@@ -1,7 +1,6 @@
 """
-Executor Agent — Sends real emails and WhatsApp messages via LeadEngine tools.
+Executor & Follow-up Agent — Sends outreach and manages the CRM pipeline.
 """
-import os
 from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 from agent.llm import get_fast_llm
@@ -11,94 +10,97 @@ from agent.tools.leadengine import (
 )
 
 EXECUTOR_SYSTEM = """
-You are the Executor Agent for LeadForge. Your ONLY job is to send real emails and WhatsApp
-messages by calling the send tools. You do not write, create or invent any content.
+You are the Executor Agent for LeadForge. You send outreach and manage the CRM pipeline.
 
-SENDER DETAILS — use these exact values for every send:
-- sender_email: use the SENDER_EMAIL environment variable value, or "outreach@dime-solutions.co.ke"
-- sender_name: use the SENDER_NAME environment variable value, or "Dimes Solutions"
+WORKFLOW for each lead:
+1. Determine channel order:
+   - SMEs (restaurants, retail, hotels, cafes): WhatsApp FIRST, then email
+   - Formal businesses (law firms, healthcare, corporate): Email FIRST, then WhatsApp
+2. Call send_email_to_lead or send_whatsapp_to_lead with the personalizer's content.
+3. Call update_lead_status with lead_id and status='contacted' after each successful send.
+4. Call schedule_follow_up with lead_id to queue the next touch in 3 days.
+5. After all sends, call get_campaign_stats() and return the EXECUTION REPORT.
 
-MANDATORY WORKFLOW for each lead (in order):
-1. Call send_email_to_lead() with:
-   - recipient_email = the lead's email address
-   - subject = the EMAIL SUBJECT from the personalizer
-   - body = the EMAIL BODY from the personalizer
-   - sender_email = (from above)
-   - sender_name = (from above)
-   Record the Message ID from the response. A Message ID = email was sent. No ID = not sent.
+RULES:
+- Do not send to the same lead more than 3 times (check sequence_step).
+- If send_email returns a bounce error, call update_lead_status with status='bounced' then call switch_channel.
+- If a lead status is 'replied', call update_lead_status with status='meeting'.
+- Log every action clearly.
 
-2. If the lead has a phone number, call send_whatsapp_to_lead() with:
-   - phone = lead's phone number (with country code)
-   - message = the WHATSAPP message from the personalizer
-   Record the Message SID. A SID = WhatsApp sent. No SID = not sent.
-
-3. Call update_lead_status(lead_id=<integer>, status="contacted")
-
-4. Call schedule_follow_up(lead_id=<integer>, follow_up_days=3, sequence_step=2)
-
-After ALL leads are done, call get_campaign_stats() then return EXACTLY this report:
-
+Return an EXECUTION REPORT:
 === EXECUTION REPORT ===
-Emails sent: X  (list Message IDs)
-WhatsApp sent: Y  (list Message SIDs)
-Bounced: Z  (list lead names)
+Emails sent: X
+WhatsApp sent: Y
+Bounced: Z
 Follow-ups scheduled: W
-High-value flagged: [names]
-Campaign stats: [output of get_campaign_stats]
+Campaign stats: [from get_campaign_stats]
 ========================
-
-ANTI-FABRICATION RULES (MANDATORY — never break these):
-- NEVER invent, assume, or fabricate any data. Every piece of information must come from a tool response.
-- NEVER write the EXECUTION REPORT before calling the send tools for every lead.
-- If send_email_to_lead returns an error, report the error exactly. Do not pretend it succeeded.
-- A Message ID or SID in the tool response is the ONLY proof of a real send.
-- If a lead has no email, skip email and go straight to WhatsApp. Document this.
-- If both email and phone are missing, call update_lead_status(status='new', notes='No contact info') and skip.
-- NEVER call a send tool twice for the same lead.
 """
 
 
 @tool
-def schedule_follow_up(lead_id: int, follow_up_days: int, sequence_step: int) -> str:
+def schedule_follow_up(lead_id: str, follow_up_days: str, sequence_step: str) -> str:
     """
-    Schedule a follow-up for a lead.
-    lead_id: integer from lead results.
-    follow_up_days: number of days until follow-up.
-    sequence_step: 1=initial, 2=first follow-up, 3=final follow-up.
+    Schedule a follow-up for a lead after a specified number of days.
+    lead_id: the lead's numeric id (pass as string or number, both work).
+    follow_up_days: number of business days until follow-up (pass as string or number).
+    sequence_step: which step in the sequence — 1=initial, 2=first follow-up, 3=final.
     """
     from datetime import datetime, timedelta
     try:
-        lead_id = int(lead_id)
+        step = int(sequence_step)
     except (ValueError, TypeError):
-        return f"Invalid lead_id '{lead_id}'."
-    if sequence_step > 3:
-        return f"Lead {lead_id}: max follow-up sequence reached. No further outreach."
-    follow_up_date = datetime.utcnow() + timedelta(days=follow_up_days)
-    labels = {1: "initial outreach", 2: "first follow-up", 3: "final follow-up"}
+        step = 2
+
+    if step > 3:
+        return f"Lead {lead_id}: maximum follow-up sequence reached (step {step}). No further outreach."
+
+    try:
+        days = int(follow_up_days)
+    except (ValueError, TypeError):
+        days = 3
+
+    follow_up_date = datetime.utcnow() + timedelta(days=days)
+    day_label = follow_up_date.strftime("%A, %d %b %Y")
+    step_labels = {1: "initial outreach", 2: "first follow-up", 3: "final follow-up"}
     return (
         f"Follow-up scheduled for lead {lead_id}: "
-        f"{labels.get(sequence_step, f'step {sequence_step}')} "
-        f"on {follow_up_date.strftime('%A, %d %b %Y')}."
+        f"{step_labels.get(step, f'step {step}')} on {day_label} ({days} days from now)."
     )
 
 
 @tool
-def switch_channel(lead_id: int, current_channel: str, reason: str) -> str:
+def check_reply_status(lead_id: str) -> str:
     """
-    Switch outreach channel when email bounces or phone is unavailable.
-    current_channel: 'email' or 'whatsapp'
+    Check if a lead has replied to any outreach.
+    lead_id: the lead's numeric id (pass as string or number, both work).
     """
-    try:
-        lead_id = int(lead_id)
-    except (ValueError, TypeError):
-        return f"Invalid lead_id '{lead_id}'."
-    alt = "whatsapp" if current_channel.lower() == "email" else "email"
-    action = (
-        "call send_email_to_lead if email is available"
-        if alt == "email"
-        else "call send_whatsapp_to_lead if phone is available"
+    return (
+        f"Lead {lead_id}: reply status check triggered. "
+        f"Call get_leads(status='replied') to see if this lead has responded. "
+        f"If found, call update_lead_status with status='meeting'."
     )
-    return f"Channel switch for lead {lead_id}: {current_channel} → {alt}. Reason: {reason}. Next: {action}."
+
+
+@tool
+def switch_channel(lead_id: str, current_channel: str, reason: str) -> str:
+    """
+    Switch the outreach channel for a lead.
+    lead_id: the lead's numeric id (pass as string or number, both work).
+    current_channel: 'email' or 'whatsapp'.
+    reason: why the channel is being switched.
+    Use when email bounces or after 2 failed attempts on one channel.
+    """
+    alt = "whatsapp" if current_channel.lower() == "email" else "email"
+    action_map = {
+        "whatsapp": "send via send_email_to_lead if email is available",
+        "email":    "send via send_whatsapp_to_lead if phone number is available",
+    }
+    return (
+        f"Channel switch for lead {lead_id}: {current_channel} → {alt}. "
+        f"Reason: {reason}. "
+        f"Next action: {action_map.get(alt, 'verify contact details')}."
+    )
 
 
 def create_executor_agent(llm=None):
@@ -110,6 +112,7 @@ def create_executor_agent(llm=None):
             update_lead_status,
             get_campaign_stats,
             schedule_follow_up,
+            check_reply_status,
             switch_channel,
         ],
         name="executor_agent",
