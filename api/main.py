@@ -235,7 +235,10 @@ async def _background_run(run_id: str, body: RunRequest):
             f"in '{body.icp.location}', max {body.max_leads} leads."
         )
 
-        config = {"configurable": {"thread_id": run_id}}
+        config = {
+            "configurable": {"thread_id": run_id},
+            "recursion_limit": 50,   # 4 agents × ~10 steps each = ~40 needed; 50 is safe ceiling
+        }
 
         await _log(run_id, "supervisor", "started", {
             "goal": body.campaign_goal,
