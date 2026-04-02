@@ -43,8 +43,8 @@ def score_lead(
     city: str,
     rating: str,
     review_count: str,
-    has_email: bool,
-    has_phone: bool,
+    has_email: str,
+    has_phone: str,
     website_description: str,
     icp_industry: str,
     icp_location: str,
@@ -54,7 +54,7 @@ def score_lead(
     Score a lead against the ICP criteria using a deterministic rubric.
     Returns a score (0-100), QUALIFIED/REJECTED decision, priority tier,
     HIGH_VALUE flag, and the top 3 scoring reasons.
-    rating and review_count accept strings or numbers — both work.
+    All numeric and boolean params accept strings or native types — both work.
     """
     try:
         rating = float(rating)
@@ -64,6 +64,12 @@ def score_lead(
         review_count = int(review_count)
     except (ValueError, TypeError):
         review_count = 0
+    # Accept "true"/"false", True/False, 1/0
+    def _to_bool(v):
+        if isinstance(v, bool): return v
+        return str(v).lower() in ("true", "1", "yes")
+    has_email = _to_bool(has_email)
+    has_phone = _to_bool(has_phone)
     score = 0
     reasons = []
 
