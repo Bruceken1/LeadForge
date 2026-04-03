@@ -163,7 +163,6 @@ def create_qualifier_agent(llm=None):
     return create_react_agent(
         model=llm or get_fast_llm(),
         tools=[score_lead, update_lead_status],
-        max_iterations=15,
         name="qualifier_agent",
         prompt=QUALIFIER_SYSTEM,
     )

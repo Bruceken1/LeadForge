@@ -113,7 +113,6 @@ def create_executor_agent(llm=None):
             schedule_follow_up,
             switch_channel,
         ],
-        max_iterations=15,
         name="executor_agent",
         prompt=EXECUTOR_SYSTEM,
     )

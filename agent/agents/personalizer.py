@@ -132,7 +132,6 @@ def create_personalization_agent(llm=None):
     return create_react_agent(
         model=llm or get_smart_llm(),
         tools=[generate_outreach_brief, get_local_context],
-        max_iterations=15,
         name="personalization_agent",
         prompt=PERSONALIZATION_SYSTEM,
     )
