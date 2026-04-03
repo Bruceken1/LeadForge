@@ -55,6 +55,7 @@ ANTI-FABRICATION RULES (MANDATORY — never break these):
 - If a lead has no email, skip email and go straight to WhatsApp. Document this.
 - If both email and phone are missing, call update_lead_status(status='new', notes='No contact info') and skip.
 - NEVER call a send tool twice for the same lead.
+- When the EXECUTION REPORT is complete, return it and stop. Do NOT call any handoff or transfer tool.
 """
 
 
@@ -112,6 +113,7 @@ def create_executor_agent(llm=None):
             schedule_follow_up,
             switch_channel,
         ],
+        max_iterations=15,
         name="executor_agent",
         prompt=EXECUTOR_SYSTEM,
     )

@@ -46,6 +46,8 @@ LEAD DETAILS:
   Recent news: [from search_company_news or 'none found']
 ======================
 
+When done, return your RESEARCH REPORT text and stop. Do NOT call any handoff or transfer tool.
+
 ANTI-FABRICATION RULES (MANDATORY):
 - NEVER invent data. Every field must come from a tool call result.
 - NEVER fabricate a description, pain point, or email. If scraping fails, write 'not available'.
@@ -66,6 +68,7 @@ def create_research_agent(llm=None):
             search_company_news,
             extract_contacts_from_page,
         ],
+        max_iterations=15,
         name="research_agent",
         prompt=RESEARCH_SYSTEM,
     )

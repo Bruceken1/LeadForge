@@ -44,7 +44,7 @@ def scrape_google_maps(keyword: str, location: str, max_results: int = 20) -> st
     if not _API_URL:
         return "Error: LeadEngine tools not configured."
 
-    # Record lead count BEFORE scrape so we can detect new leads
+    # Record the IDs already in DB so we can detect genuinely NEW leads
     try:
         before_r = httpx.get(
             f"{_API_URL}/api/leads",
@@ -52,9 +52,13 @@ def scrape_google_maps(keyword: str, location: str, max_results: int = 20) -> st
             params={"status": "new", "limit": 200},
             timeout=15,
         )
-        leads_before = len(_parse_leads(before_r.json())) if before_r.is_success else 0
+        existing_ids = set(
+            l.get("id") for l in _parse_leads(before_r.json())
+        ) if before_r.is_success else set()
     except Exception:
-        leads_before = 0
+        existing_ids = set()
+
+    print(f"Scrape starting for '{keyword}' in '{location}'. Existing lead IDs: {existing_ids}")
 
     # Trigger the scrape job
     try:
@@ -70,16 +74,14 @@ def scrape_google_maps(keyword: str, location: str, max_results: int = 20) -> st
     if r.status_code not in (200, 202):
         return f"Error starting scrape: HTTP {r.status_code} — {r.text[:300]}"
 
-    print(f"Scrape job started for '{keyword}' in '{location}'. Leads before: {leads_before}")
-
-    # Poll for NEW leads — up to 90 seconds (18 × 5s)
+    # Poll for GENUINELY NEW leads (IDs not seen before) — up to 90 seconds
     for attempt in range(18):
         time.sleep(5)
         try:
             leads_r = httpx.get(
                 f"{_API_URL}/api/leads",
                 headers=_headers(),
-                params={"status": "new", "limit": max_results},
+                params={"status": "new", "limit": max_results + len(existing_ids)},
                 timeout=15,
             )
         except httpx.RequestError as e:
@@ -87,35 +89,32 @@ def scrape_google_maps(keyword: str, location: str, max_results: int = 20) -> st
             continue
 
         if leads_r.is_success:
-            leads = _parse_leads(leads_r.json())
-            # Accept if we have more leads than before, OR if we have leads after waiting 30s
-            new_count = len(leads)
-            if new_count > leads_before or (attempt >= 5 and new_count > 0):
-                print(f"Scrape complete: {new_count} leads found (was {leads_before})")
-                # Return full lead details including lead_id for downstream agents
-                lead_summaries = []
-                for lead in leads[:max_results]:
-                    lead_summaries.append({
-                        "lead_id": lead.get("id"),
-                        "name": lead.get("name"),
-                        "email": lead.get("email"),
-                        "phone": lead.get("phone"),
-                        "website": lead.get("website"),
-                        "address": lead.get("address"),
-                        "city": lead.get("city"),
-                        "industry": lead.get("industry"),
-                        "rating": lead.get("rating"),
-                        "reviews": lead.get("reviews"),
-                        "status": lead.get("status"),
-                    })
+            all_leads = _parse_leads(leads_r.json())
+            # Only return leads that are NEW (not in existing_ids)
+            new_leads = [l for l in all_leads if l.get("id") not in existing_ids]
+            print(f"Attempt {attempt+1}: {len(all_leads)} total, {len(new_leads)} new")
+            if new_leads:
+                lead_summaries = [{
+                    "lead_id": l.get("id"),
+                    "name": l.get("name"),
+                    "email": l.get("email"),
+                    "phone": l.get("phone"),
+                    "website": l.get("website"),
+                    "address": l.get("address"),
+                    "city": l.get("city"),
+                    "industry": l.get("industry"),
+                    "rating": l.get("rating"),
+                    "reviews": l.get("reviews"),
+                } for l in new_leads[:max_results]]
                 return (
-                    f"Scraped {new_count} leads for '{keyword}' in '{location}'.\n"
+                    f"Scraped {len(new_leads)} NEW leads for '{keyword}' in '{location}'.\n"
                     f"LEADS (include lead_id in all downstream calls):\n{lead_summaries}"
                 )
 
     return (
-        f"Scrape submitted for '{keyword}' in '{location}' but no new leads detected after 90s. "
-        f"Call get_leads(status='new') to check if any arrived."
+        f"Scrape submitted for '{keyword}' in '{location}' but no new leads appeared after 90s. "
+        f"The Google Maps scrape may have found no results for this keyword/location. "
+        f"Proceed to qualifier with whatever leads are available via get_leads()."
     )
 
 

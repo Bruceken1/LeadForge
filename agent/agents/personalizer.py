@@ -43,6 +43,8 @@ RULES:
 - Kenya/Tanzania: WhatsApp can start with "Habari" for local businesses
 - After all leads done: output "PERSONALIZATION COMPLETE: X packages generated"
 
+When done, return your report text and stop. Do NOT call any handoff or transfer tool.
+
 ANTI-FABRICATION RULES (MANDATORY):
 - NEVER invent a lead_id. Use only the integer id from the qualifier's output.
 - NEVER fabricate an email address. Use only what the qualifier provided.
@@ -130,6 +132,7 @@ def create_personalization_agent(llm=None):
     return create_react_agent(
         model=llm or get_smart_llm(),
         tools=[generate_outreach_brief, get_local_context],
+        max_iterations=15,
         name="personalization_agent",
         prompt=PERSONALIZATION_SYSTEM,
     )
