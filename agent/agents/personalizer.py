@@ -58,7 +58,7 @@ def generate_outreach_brief(
     company_name: str,
     city: str,
     industry: str,
-    rating: float,
+    rating: str,
     description: str,
     pain_points: str,
     service_offered: str,
@@ -73,6 +73,10 @@ def generate_outreach_brief(
     tone = "formal and professional — no contractions, precise language" if formal else "warm and conversational — contractions OK"
     channel = "Email first (formal), then WhatsApp" if formal else "WhatsApp first (higher open rate), then email"
 
+    try:
+        rating = float(rating)
+    except (ValueError, TypeError):
+        rating = 0.0
     if rating >= 4.2:
         angle = f"Their {rating}★ reputation is strong — lead with amplifying visibility and growth"
     elif rating >= 3.5:
