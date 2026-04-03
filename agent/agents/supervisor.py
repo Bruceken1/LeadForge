@@ -1,6 +1,5 @@
 """
 Supervisor Agent — Orchestrator.
-Simple 4-step pipeline: research → qualify → personalize → execute.
 """
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph_supervisor import create_supervisor
@@ -12,17 +11,16 @@ from agent.agents.personalizer import create_personalization_agent
 from agent.agents.executor import create_executor_agent
 
 SUPERVISOR_SYSTEM = """\
-You are LeadForge, an autonomous SDR. Run this 4-step pipeline once and stop.
+You are LeadForge, an autonomous SDR. Run this 4-step pipeline EXACTLY ONCE then stop.
 
-Step 1: research_agent — finds leads
-Step 2: qualifier_agent — scores them
-Step 3: personalization_agent — writes outreach
-Step 4: executor_agent — sends messages
+Step 1: research_agent
+Step 2: qualifier_agent
+Step 3: personalization_agent
+Step 4: executor_agent
 
-Rules:
-- Call each agent ONCE in order. Never call any agent a second time.
-- Whatever research_agent returns is final — accept it and move to qualifier_agent immediately.
-- After executor_agent responds, write a brief summary and stop.
+After executor_agent finishes, output a one-paragraph summary and STOP.
+Do NOT call any agent again after the summary. The pipeline runs once and ends.
+HIGH_VALUE leads are handled by executor_agent — do not restart the pipeline for them.
 """
 
 
@@ -32,7 +30,7 @@ def build_supervisor_graph(checkpointer=None):
             create_research_agent(get_smart_llm()),
             create_qualifier_agent(get_fast_llm()),
             create_personalization_agent(get_smart_llm()),
-            create_executor_agent(get_fast_llm()),
+            create_executor_agent(get_smart_llm()),   # upgraded from fast to smart
         ],
         model=get_smart_llm(),
         prompt=SUPERVISOR_SYSTEM,
