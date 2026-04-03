@@ -225,22 +225,23 @@ async def _background_run(run_id: str, body: RunRequest):
     try:
         configure_tools(body.leadengine_api_url, body.leadengine_token, body.org_id)
 
+        import os
+        sender_email = os.environ.get("SENDER_EMAIL", "outreach@dime-solutions.co.ke")
+        sender_name  = os.environ.get("SENDER_NAME",  "Dimes Solutions")
+
         user_message = (
-            f"Run a full LeadForge campaign:\n\n"
-            f"Goal: {body.campaign_goal}\n"
-            f"Industry: {body.icp.industry}\n"
-            f"Location: {body.icp.location}\n"
-            f"Max leads: {body.max_leads}\n"
-            f"Min rating: {body.icp.min_rating}\n"
-            f"Org: {body.org_name}\n\n"
-            f"Call agents in order: research_agent, qualifier_agent, "
-            f"personalization_agent, executor_agent."
+            f"Campaign goal: {body.campaign_goal}\n"
+            f"ICP: {body.icp.industry} in {body.icp.location}, "
+            f"min_rating={body.icp.min_rating}, min_reviews={body.icp.min_reviews}, "
+            f"max_leads={body.max_leads}\n"
+            f"Org: {body.org_name}\n"
+            f"SENDER_EMAIL: {sender_email}\n"
+            f"SENDER_NAME: {sender_name}\n\n"
+            f"START NOW: call research_agent to scrape '{body.icp.industry}' "
+            f"in '{body.icp.location}', max {body.max_leads} leads."
         )
 
-        config = {
-            "configurable": {"thread_id": run_id},
-            "recursion_limit": 50,   # 4 agents × ~10 steps each = ~40 needed; 50 is safe ceiling
-        }
+        config = {"configurable": {"thread_id": run_id}}
 
         await _log(run_id, "supervisor", "started", {
             "goal": body.campaign_goal,
@@ -286,38 +287,7 @@ async def _background_run(run_id: str, body: RunRequest):
                         })
 
         print(f"[{run_id}] Graph finished. Total chunks: {chunk_count}")
-
-        # Parse stats from logged events to update the run counters
-        import re
-        qualified = 0
-        sent = 0
-        total = 0
-        try:
-            async with _db_pool.acquire() as conn:
-                events = await conn.fetch(
-                    "SELECT data FROM agent_events WHERE run_id=$1 ORDER BY id",
-                    run_id,
-                )
-            all_content = " ".join(
-                json.loads(e["data"]).get("content", "") for e in events
-            ).lower()
-            q_match = re.search(r"qualified[:\s]+(\d+)", all_content)
-            if q_match:
-                qualified = int(q_match.group(1))
-            s_match = re.search(r"emails?\s+sent[:\s]+(\d+)", all_content)
-            if s_match:
-                sent = int(s_match.group(1))
-            t_match = re.search(r"(?:total\s+)?leads?\s+found[:\s]+(\d+)", all_content)
-            if t_match:
-                total = int(t_match.group(1))
-        except Exception as stats_err:
-            print(f"[{run_id}] Stats parse error (non-fatal): {stats_err}")
-
-        await _set_status(run_id, "completed", {
-            "total_leads": total,
-            "qualified":   qualified,
-            "sent":        sent,
-        })
+        await _set_status(run_id, "completed")
         await _log(run_id, "supervisor", "completed", {
             "message": f"All agents finished ({chunk_count} graph updates processed)"
         })

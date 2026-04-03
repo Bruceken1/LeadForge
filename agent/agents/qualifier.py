@@ -1,5 +1,5 @@
 """
-Qualifier Agent — Scores each lead against the ICP.
+Qualifier Agent — Scores leads against the ICP using a deterministic rubric.
 """
 from langgraph.prebuilt import create_react_agent
 from langchain_core.tools import tool
@@ -7,22 +7,44 @@ from agent.llm import get_fast_llm
 from agent.tools.leadengine import update_lead_status
 
 QUALIFIER_SYSTEM = """
-You are the Qualifier Agent for LeadForge. Score each lead against the ICP.
+You are the Qualifier Agent for LeadForge. You score every lead from the RESEARCH REPORT
+against the ICP and decide QUALIFY or REJECT.
 
-Use score_lead for EVERY lead. Then call update_lead_status for each.
+MANDATORY WORKFLOW:
+1. For EVERY lead in the research report, call score_lead() with data from that report.
+   You MUST call score_lead for each lead — never skip a lead.
+2. For each QUALIFIED lead, call update_lead_status(lead_id=<integer>, status='new', notes='qualified').
+3. For each REJECTED lead, call update_lead_status(lead_id=<integer>, status='new', notes='rejected').
+4. Return the QUALIFICATION SUMMARY below.
 
-IMPORTANT — how to call score_lead:
-- email_status: pass "yes" if the lead has an email address, "no" if not
-- phone_status: pass "yes" if the lead has a phone number, "no" if not
-- rating: pass the numeric rating as a string e.g. "4.9"
-- review_count: pass the number of reviews as a string e.g. "190"
+OUTPUT FORMAT:
 
-Return a QUALIFICATION SUMMARY:
+QUALIFICATION SUMMARY
 ---------------------
 Total scored: X
-Qualified: Y → [names]
-Rejected: Z → [names]
-High-value (score>=85, reviews>100, has email): [names if any]
+Qualified: Y  →  [list names]
+Rejected: Z   →  [list names]
+High-value (score >=85, reviews>100, has email): [names or 'none']
+
+QUALIFIED LEAD DETAILS (include for each qualified lead — needed by personalizer and executor):
+[For each qualified lead:]
+  lead_id: [integer — CRITICAL]
+  Name: [name]
+  Email: [email or 'none']
+  Phone: [phone or 'none']
+  City: [city]
+  Industry: [industry]
+  Rating: [rating]
+  Score: [score]/100
+  Description: [from research report]
+  Pain points: [from research report]
+  High-value: [yes/no]
+
+ANTI-FABRICATION RULES (MANDATORY):
+- NEVER score a lead without calling score_lead(). The tool does the scoring — not you.
+- NEVER qualify a lead that was not in the research report.
+- NEVER fabricate a score. Use only the score returned by score_lead().
+- The lead_id must be the exact integer from the research report.
 """
 
 
@@ -31,95 +53,87 @@ def score_lead(
     lead_name: str,
     industry: str,
     city: str,
-    rating: str,
-    review_count: str,
-    email_status: str,
-    phone_status: str,
+    rating: float,
+    review_count: int,
+    has_email: bool,
+    has_phone: bool,
     website_description: str,
     icp_industry: str,
     icp_location: str,
     campaign_goal: str,
 ) -> str:
     """
-    Score a lead against the ICP criteria.
-    email_status: 'yes' or 'no' — whether the lead has an email address.
-    phone_status: 'yes' or 'no' — whether the lead has a phone number.
-    rating: numeric rating as a string e.g. '4.9'.
-    review_count: number of reviews as a string e.g. '190'.
-    All other fields are plain strings.
+    Score a lead against the ICP using a deterministic rubric (0-100).
+    Returns score, QUALIFIED/REJECTED decision, priority, HIGH_VALUE flag, and top reasons.
     """
-    try:
-        r = float(rating)
-    except (ValueError, TypeError):
-        r = 0.0
-    try:
-        rc = int(review_count)
-    except (ValueError, TypeError):
-        rc = 0
-
-    has_email = str(email_status).strip().lower() in ("yes", "true", "1")
-    has_phone = str(phone_status).strip().lower() in ("yes", "true", "1")
-
     score = 0
     reasons = []
 
     # 1. Industry match (0-20)
-    if icp_industry.lower() in industry.lower() or industry.lower() in icp_industry.lower():
+    icp_ind = icp_industry.lower()
+    lead_ind = industry.lower()
+    if icp_ind in lead_ind or lead_ind in icp_ind:
         score += 20
         reasons.append(f"Industry match: '{industry}' ↔ '{icp_industry}' (+20)")
-    elif any(w in industry.lower() for w in icp_industry.lower().split() if len(w) > 3):
+    elif any(w in lead_ind for w in icp_ind.split() if len(w) > 3):
         score += 10
         reasons.append(f"Partial industry match (+10)")
     else:
         reasons.append(f"Industry mismatch: '{industry}' vs '{icp_industry}' (+0)")
 
     # 2. Location match (0-20)
-    if city.lower() in icp_location.lower() or icp_location.lower() in city.lower():
+    icp_loc = icp_location.lower()
+    city_l = city.lower()
+    if city_l in icp_loc or any(city_l in c for c in icp_loc.replace(",", " ").split()):
         score += 20
         reasons.append(f"Location match: '{city}' in '{icp_location}' (+20)")
     else:
         reasons.append(f"Location mismatch: '{city}' vs '{icp_location}' (+0)")
 
-    # 3. Reputation (0-20)
-    if r >= 4.0 and rc >= 50:
+    # 3. Reputation signals (0-20)
+    if rating >= 4.0 and review_count >= 50:
         score += 20
-        reasons.append(f"Strong: {r}★, {rc} reviews (+20)")
-    elif r >= 3.5 and rc >= 20:
+        reasons.append(f"Strong: {rating}★, {review_count} reviews (+20)")
+    elif rating >= 3.5 and review_count >= 20:
         score += 14
-        reasons.append(f"Good: {r}★, {rc} reviews (+14)")
-    elif r >= 3.0 and rc >= 5:
+        reasons.append(f"Good: {rating}★, {review_count} reviews (+14)")
+    elif rating >= 3.0 and review_count >= 5:
         score += 8
-        reasons.append(f"Moderate: {r}★, {rc} reviews (+8)")
+        reasons.append(f"Moderate: {rating}★, {review_count} reviews (+8)")
     else:
         score += 2
-        reasons.append(f"Weak: {r}★, {rc} reviews (+2)")
+        reasons.append(f"Weak signals (+2)")
 
-    # 4. Contact (0-20, penalty if none)
+    # 4. Contact availability (0-20, penalty if none)
     if has_email and has_phone:
         score += 20
-        reasons.append("Email + phone (+20)")
+        reasons.append("Full contact: email + phone (+20)")
     elif has_email:
         score += 16
-        reasons.append("Email only (+16)")
+        reasons.append("Email available (+16)")
     elif has_phone:
         score += 10
         reasons.append("Phone only — WhatsApp possible (+10)")
     else:
         score -= 20
-        reasons.append("No contact info (-20)")
+        reasons.append("No contact info — critical gap (-20)")
 
-    # 5. Relevance (0-20)
+    # 5. Campaign relevance (0-20)
     desc = (website_description or "").lower()
-    hits = sum(1 for w in campaign_goal.lower().split() if len(w) > 4 and w in desc)
+    goal_kws = [w for w in campaign_goal.lower().split() if len(w) > 4]
+    hits = sum(1 for kw in goal_kws if kw in desc)
     if hits >= 3:
         score += 20
         reasons.append(f"High relevance: {hits} keyword matches (+20)")
     elif hits >= 1:
         score += 12
-        reasons.append(f"Moderate relevance (+12)")
+        reasons.append(f"Moderate relevance: {hits} match(es) (+12)")
+    elif website_description and len(website_description) > 30:
+        score += 8
+        reasons.append("Has description but low keyword overlap (+8)")
     else:
         score += 3
-        reasons.append("Low relevance (+3)")
+        reasons.append("Minimal description (+3)")
 
     score = max(0, min(100, score))
 
@@ -132,14 +146,13 @@ def score_lead(
     else:
         decision, priority = "REJECTED", "NONE"
 
-    high_value = score >= 85 and rc > 100 and has_email
-    hv = "\n⭐ HIGH_VALUE — pause for human review" if high_value else ""
+    high_value = score >= 85 and review_count > 100 and has_email
+    hv = "\n⭐ HIGH_VALUE — flag for human review" if high_value else ""
 
-    reasons_str = "\n".join(f"  {i+1}. {r}" for i, r in enumerate(reasons[:3]))
     return (
-        f"SCORE: {score}/100 | DECISION: {decision} | PRIORITY: {priority}{hv}\n"
+        f"SCORE: {score}/100 | {decision} | {priority}{hv}\n"
         f"Lead: {lead_name} ({industry}, {city})\n"
-        f"Reasons:\n{reasons_str}\n"
+        f"Reasons:\n" + "\n".join(f"  {i+1}. {r}" for i, r in enumerate(reasons[:3])) + "\n"
         f"Contact: email={'yes' if has_email else 'no'}, phone={'yes' if has_phone else 'no'}"
     )
 
