@@ -1,5 +1,7 @@
 """
-LeadEngine Tools — wrap the LeadEngine Cloudflare Worker API as LangChain tools.
+LeadEngine Tools.
+NOTE: All numeric id params typed as str — Groq rejects int/bool schema types
+when the LLM passes them as strings. Coerce inside the function.
 """
 import httpx
 import time
@@ -32,35 +34,37 @@ def _parse_leads(data) -> list:
     return []
 
 
+def _fmt(leads: list) -> str:
+    rows = []
+    for l in leads:
+        rows.append(
+            f"id={l.get('id')} | {l.get('name')} | {l.get('industry','?')} | "
+            f"{l.get('city','?')} | {l.get('rating','?')}★ ({l.get('review_count', l.get('reviews','?'))} reviews) | "
+            f"email={l.get('email') or 'none'} | phone={l.get('phone') or 'none'} | "
+            f"website={l.get('website') or 'none'}"
+        )
+    return "\n".join(rows)
+
+
+def _to_int(v, name):
+    try:
+        return int(v), None
+    except (ValueError, TypeError):
+        return None, f"Invalid {name} '{v}'"
+
+
 @tool
 def scrape_google_maps(keyword: str, location: str, max_results: int = 20) -> str:
     """
-    Scrape Google Maps for local businesses by keyword and location.
-    This triggers a background scrape job and waits up to 90 seconds for results.
-    Returns leads with name, phone, website, address, rating, review count, and lead_id.
-    ALWAYS call this first before get_leads().
-    Example: keyword='law firms', location='Nairobi, Kenya'
+    Trigger a Google Maps scrape for businesses matching keyword and location.
+    Waits up to 90 seconds for results. Returns all leads found with id, name,
+    industry, city, rating, review_count, email, phone, website.
+    Call this ONCE. Do not retry with different keywords.
     """
     if not _API_URL:
-        return "Error: LeadEngine tools not configured."
+        return "Error: tools not configured."
 
-    # Record the IDs already in DB so we can detect genuinely NEW leads
-    try:
-        before_r = httpx.get(
-            f"{_API_URL}/api/leads",
-            headers=_headers(),
-            params={"status": "new", "limit": 200},
-            timeout=15,
-        )
-        existing_ids = set(
-            l.get("id") for l in _parse_leads(before_r.json())
-        ) if before_r.is_success else set()
-    except Exception:
-        existing_ids = set()
-
-    print(f"Scrape starting for '{keyword}' in '{location}'. Existing lead IDs: {existing_ids}")
-
-    # Trigger the scrape job
+    # Trigger scrape
     try:
         r = httpx.post(
             f"{_API_URL}/api/scrape",
@@ -69,155 +73,82 @@ def scrape_google_maps(keyword: str, location: str, max_results: int = 20) -> st
             timeout=30,
         )
     except httpx.RequestError as e:
-        return f"Network error starting scrape: {str(e)}"
+        return f"Network error: {e}"
 
     if r.status_code not in (200, 202):
-        return f"Error starting scrape: HTTP {r.status_code} — {r.text[:300]}"
+        return f"Scrape error: HTTP {r.status_code} — {r.text[:200]}"
 
-    # Poll for GENUINELY NEW leads (IDs not seen before) — up to 90 seconds
-    for attempt in range(18):
+    # Check for immediate results
+    try:
+        leads = _parse_leads(r.json())
+        if leads:
+            return f"Found {len(leads)} leads:\n{_fmt(leads[:20])}"
+    except Exception:
+        pass
+
+    # Poll all leads (not just 'new') — avoid missing leads due to status filter
+    for _ in range(18):
         time.sleep(5)
         try:
-            leads_r = httpx.get(
+            poll = httpx.get(
                 f"{_API_URL}/api/leads",
                 headers=_headers(),
-                params={"status": "new", "limit": max_results + len(existing_ids)},
+                params={"status": "all", "limit": max_results},
                 timeout=15,
             )
-        except httpx.RequestError as e:
-            print(f"Polling attempt {attempt+1} error: {e}")
+            if poll.is_success:
+                leads = _parse_leads(poll.json())
+                if leads:
+                    return f"Found {len(leads)} leads:\n{_fmt(leads[:20])}"
+        except httpx.RequestError:
             continue
 
-        if leads_r.is_success:
-            all_leads = _parse_leads(leads_r.json())
-            # Only return leads that are NEW (not in existing_ids)
-            new_leads = [l for l in all_leads if l.get("id") not in existing_ids]
-            print(f"Attempt {attempt+1}: {len(all_leads)} total, {len(new_leads)} new")
-            if new_leads:
-                lead_summaries = [{
-                    "lead_id": l.get("id"),
-                    "name": l.get("name"),
-                    "email": l.get("email"),
-                    "phone": l.get("phone"),
-                    "website": l.get("website"),
-                    "address": l.get("address"),
-                    "city": l.get("city"),
-                    "industry": l.get("industry"),
-                    "rating": l.get("rating"),
-                    "reviews": l.get("reviews"),
-                } for l in new_leads[:max_results]]
-                return (
-                    f"Scraped {len(new_leads)} NEW leads for '{keyword}' in '{location}'.\n"
-                    f"LEADS (include lead_id in all downstream calls):\n{lead_summaries}"
-                )
-
-    return (
-        f"Scrape submitted for '{keyword}' in '{location}' but no new leads appeared after 90s. "
-        f"The Google Maps scrape may have found no results for this keyword/location. "
-        f"Proceed to qualifier with whatever leads are available via get_leads()."
-    )
+    return "Scrape complete but no leads returned. Proceed with 0 leads."
 
 
 @tool
-def get_leads(status: str = "new", search: str = "", limit: int = 50) -> str:
+def enrich_lead_email(lead_id: str) -> str:
     """
-    Retrieve leads from the LeadEngine database.
-    status: 'new' | 'contacted' | 'replied' | 'meeting' | 'closed' | 'bounced' | 'all'
-    Returns leads with all fields including lead_id (integer) needed for other tools.
+    Enrich a lead's email via Apollo/Hunter. lead_id: numeric id from scrape results.
     """
     if not _API_URL:
-        return "Error: LeadEngine tools not configured."
-
-    params: dict = {"status": status, "limit": limit}
-    if search:
-        params["search"] = search
-
+        return "Error: tools not configured."
+    lid, err = _to_int(lead_id, "lead_id")
+    if err:
+        return err
     try:
-        r = httpx.get(f"{_API_URL}/api/leads", headers=_headers(), params=params, timeout=15)
+        r = httpx.post(f"{_API_URL}/api/leads/{lid}/enrich", headers=_headers(), timeout=20)
     except httpx.RequestError as e:
-        return f"Network error fetching leads: {str(e)}"
-
+        return f"Network error: {e}"
     if r.is_success:
-        leads = _parse_leads(r.json())
-        if not leads:
-            return f"No leads found with status='{status}'."
-        summaries = [{
-            "lead_id": l.get("id"),
-            "name": l.get("name"),
-            "email": l.get("email"),
-            "phone": l.get("phone"),
-            "website": l.get("website"),
-            "city": l.get("city"),
-            "industry": l.get("industry"),
-            "rating": l.get("rating"),
-            "reviews": l.get("reviews"),
-        } for l in leads]
-        return f"Found {len(summaries)} leads (status={status}):\n{summaries}"
-
-    return f"Error fetching leads: HTTP {r.status_code} — {r.text[:200]}"
+        d = r.json()
+        email = d.get("email")
+        return f"Lead {lid}: email={'found: ' + email if email else 'not found'}"
+    return f"Enrichment failed: HTTP {r.status_code}"
 
 
 @tool
-def update_lead_status(lead_id: int, status: str, notes: str = "") -> str:
+def update_lead_status(lead_id: str, status: str, notes: str = "") -> str:
     """
-    Update a lead's CRM pipeline stage.
-    lead_id: integer ID from get_leads or scrape_google_maps results.
-    status: new | contacted | replied | meeting | closed | bounced | unsubscribed
+    Update a lead's CRM status.
+    lead_id: numeric id. status: new|contacted|replied|meeting|closed|bounced|unsubscribed
     """
     if not _API_URL:
-        return "Error: LeadEngine tools not configured."
-
-    try:
-        lead_id = int(lead_id)
-    except (ValueError, TypeError):
-        return f"Invalid lead_id '{lead_id}' — must be an integer from lead results."
-
-    valid = {"new", "contacted", "replied", "meeting", "closed", "bounced", "unsubscribed"}
+        return "Error: tools not configured."
+    lid, err = _to_int(lead_id, "lead_id")
+    if err:
+        return err
+    valid = {"new","contacted","replied","meeting","closed","bounced","unsubscribed"}
     if status not in valid:
-        return f"Invalid status '{status}'. Must be one of: {', '.join(sorted(valid))}"
-
+        return f"Invalid status '{status}'"
     body: dict = {"status": status}
     if notes:
         body["notes"] = notes
-
     try:
-        r = httpx.patch(f"{_API_URL}/api/leads/{lead_id}", headers=_headers(), json=body, timeout=10)
+        r = httpx.patch(f"{_API_URL}/api/leads/{lid}", headers=_headers(), json=body, timeout=10)
     except httpx.RequestError as e:
-        return f"Network error updating lead {lead_id}: {str(e)}"
-
-    if r.is_success:
-        return f"Lead {lead_id} updated to '{status}'" + (f" — {notes}" if notes else "")
-    return f"Error updating lead {lead_id}: HTTP {r.status_code} — {r.text[:200]}"
-
-
-@tool
-def enrich_lead_email(lead_id: int) -> str:
-    """
-    Trigger email enrichment for a lead using Apollo.io + Hunter.io.
-    lead_id: integer ID from lead results. Finds email from the lead's website domain.
-    Call this for any lead that has a website but no email.
-    """
-    if not _API_URL:
-        return "Error: LeadEngine tools not configured."
-
-    try:
-        lead_id = int(lead_id)
-    except (ValueError, TypeError):
-        return f"Invalid lead_id '{lead_id}' — must be an integer."
-
-    try:
-        r = httpx.post(f"{_API_URL}/api/leads/{lead_id}/enrich", headers=_headers(), timeout=20)
-    except httpx.RequestError as e:
-        return f"Network error enriching lead {lead_id}: {str(e)}"
-
-    if r.is_success:
-        lead = r.json()
-        email = lead.get("email")
-        status = lead.get("email_status", "unknown")
-        if email:
-            return f"Lead {lead_id} enriched. Email: {email} (status: {status})"
-        return f"Lead {lead_id} enriched. No email found (status: {status})."
-    return f"Enrichment failed for lead {lead_id}: HTTP {r.status_code} — {r.text[:200]}"
+        return f"Network error: {e}"
+    return f"Lead {lid} → '{status}'" if r.is_success else f"Error: HTTP {r.status_code}"
 
 
 @tool
@@ -228,23 +159,13 @@ def send_email_to_lead(
     sender_email: str,
     sender_name: str,
 ) -> str:
-    """
-    Send a cold outreach email via Resend.
-    ALL parameters are required. recipient_email must be a real email address.
-    Returns a Message ID on success — this is proof the email was sent.
-    If no Message ID is returned, the email was NOT sent.
-    """
+    """Send outreach email via Resend. All fields required."""
     if not _API_URL:
-        return "Error: LeadEngine tools not configured."
+        return "Error: tools not configured."
     if not recipient_email or "@" not in recipient_email:
-        return f"Cannot send: invalid email '{recipient_email}'."
-    if not subject:
-        return "Cannot send: email subject is empty."
-    if not body:
-        return "Cannot send: email body is empty."
-    if not sender_email or "@" not in sender_email:
-        return "Cannot send: sender_email is missing or invalid."
-
+        return f"Invalid email: '{recipient_email}'"
+    if not subject or not body:
+        return "Missing subject or body."
     try:
         r = httpx.post(
             f"{_API_URL}/api/outreach/send-email",
@@ -254,37 +175,25 @@ def send_email_to_lead(
             timeout=20,
         )
     except httpx.RequestError as e:
-        return f"Network error sending to {recipient_email}: {str(e)}"
-
+        return f"Network error: {e}"
     if r.is_success:
-        data = r.json()
-        msg_id = data.get("message_id") or data.get("id", "unknown")
-        return f"EMAIL SENT to {recipient_email}. Subject: '{subject}'. Message ID: {msg_id}"
-    err = r.text[:300]
-    if r.status_code in (400, 422) and "bounce" in err.lower():
-        return f"EMAIL BOUNCED for {recipient_email}: {err}"
-    return f"Email failed for {recipient_email}: HTTP {r.status_code} — {err}"
+        d = r.json()
+        return f"Email sent to {recipient_email}. ID: {d.get('message_id') or d.get('id')}"
+    return f"Send failed: HTTP {r.status_code} — {r.text[:150]}"
 
 
 @tool
 def send_whatsapp_to_lead(phone: str, message: str) -> str:
-    """
-    Send a WhatsApp message via Twilio.
-    phone must include country code e.g. +254712345678.
-    Returns a Message SID on success — this is proof the message was sent.
-    If no SID is returned, the message was NOT sent.
-    """
+    """Send WhatsApp via Twilio. Phone must include country code e.g. +254712345678."""
     if not _API_URL:
-        return "Error: LeadEngine tools not configured."
+        return "Error: tools not configured."
     if not phone:
-        return "Cannot send WhatsApp: phone number is missing."
+        return "No phone number."
     if not message:
-        return "Cannot send WhatsApp: message is empty."
-
+        return "No message."
     phone = phone.strip()
     if not phone.startswith("+"):
         phone = "+" + phone
-
     try:
         r = httpx.post(
             f"{_API_URL}/api/outreach/send-whatsapp",
@@ -293,35 +202,33 @@ def send_whatsapp_to_lead(phone: str, message: str) -> str:
             timeout=20,
         )
     except httpx.RequestError as e:
-        return f"Network error sending WhatsApp to {phone}: {str(e)}"
-
+        return f"Network error: {e}"
     if r.is_success:
-        data = r.json()
-        sid = data.get("sid") or data.get("message_sid", "unknown")
-        return f"WHATSAPP SENT to {phone}. Message SID: {sid}"
-    return f"WhatsApp failed for {phone}: HTTP {r.status_code} — {r.text[:200]}"
+        d = r.json()
+        return f"WhatsApp sent to {phone}. SID: {d.get('sid') or d.get('message_sid')}"
+    return f"WhatsApp failed: HTTP {r.status_code} — {r.text[:150]}"
 
 
 @tool
-def get_campaign_stats(campaign_id: Optional[int] = None) -> str:
-    """
-    Get campaign performance stats from LeadEngine.
-    Returns sent, opened, replied, bounced counts.
-    """
+def get_campaign_stats(campaign_id: Optional[str] = None) -> str:
+    """Get campaign stats. Omit campaign_id for overall stats."""
     if not _API_URL:
-        return "Error: LeadEngine tools not configured."
-
-    url = f"{_API_URL}/api/campaigns/{campaign_id}" if campaign_id else f"{_API_URL}/api/stats"
+        return "Error: tools not configured."
+    url = f"{_API_URL}/api/stats"
+    if campaign_id:
+        cid, err = _to_int(campaign_id, "campaign_id")
+        if err:
+            return err
+        url = f"{_API_URL}/api/campaigns/{cid}"
     try:
         r = httpx.get(url, headers=_headers(), timeout=10)
     except httpx.RequestError as e:
-        return f"Network error fetching stats: {str(e)}"
-
+        return f"Network error: {e}"
     if r.is_success:
-        data = r.json()
-        if isinstance(data, dict):
-            keys = ["sent", "opened", "replied", "bounced", "meetings", "total_leads", "qualified"]
-            s = " | ".join(f"{k}: {data[k]}" for k in keys if k in data)
-            return s if s else str(data)
-        return str(data)
-    return f"Error fetching stats: HTTP {r.status_code} — {r.text[:200]}"
+        d = r.json()
+        if isinstance(d, dict):
+            keys = ["sent","opened","replied","bounced","meetings","total_leads","qualified"]
+            s = " | ".join(f"{k}: {d[k]}" for k in keys if k in d)
+            return s or str(d)
+        return str(d)
+    return f"Error: HTTP {r.status_code}"
