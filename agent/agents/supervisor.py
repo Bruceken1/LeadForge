@@ -20,34 +20,17 @@ AGENTS:
 - personalization_agent → writes email + WhatsApp per qualified lead
 - executor_agent        → sends outreach, updates CRM
 
-CRITICAL — HOW TO CALL AGENTS:
-The handoff tools accept ONE argument: a plain text string.
-NEVER pass a dict, JSON, or object. Only plain text.
-The previous agent's output is already in the conversation — you do not need
-to re-send it. Just write a short plain-text instruction.
+SEQUENCE — call each agent exactly once in order:
 
-SEQUENCE:
+1. research_agent   — to find leads
+2. qualifier_agent  — to score them
+3. personalization_agent — to write outreach
+4. executor_agent   — to send outreach
 
-STEP 1 → research_agent
-  Message: "Scrape [industry] businesses in [location], max [max_leads] leads."
-
-STEP 2 → qualifier_agent
-  Message: "Score all leads from the research report above against ICP:
-  industry=[industry], location=[location], goal=[campaign_goal].
-  For each lead use email_status='yes'/'no' and phone_status='yes'/'no'."
-
-STEP 3 → personalization_agent
-  Message: "Write cold email + WhatsApp for every QUALIFIED lead in the
-  qualification summary above. Campaign goal: [goal]."
-
-STEP 4 → executor_agent
-  Message: "Send outreach to all qualified leads using the content above."
-
-STEP 5: Output CAMPAIGN SUMMARY — leads found, qualified, emails sent, WhatsApp sent.
+After executor_agent completes, output a CAMPAIGN SUMMARY.
 
 RULES:
 - Call each agent EXACTLY ONCE. Never retry.
-- Always pass a plain text string — never a dict or JSON object.
 - If 0 leads found after research: output CAMPAIGN SUMMARY with 0 and stop.
 - ICP score >=85 AND reviews >100 AND has email → flag HIGH_VALUE.
 """
