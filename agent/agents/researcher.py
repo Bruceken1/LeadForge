@@ -35,6 +35,11 @@ Decision maker: [title]
 
 Important: call scrape_google_maps exactly once. Do not retry with different keywords.
 Do not call get_leads — it returns stale data. Do not call any transfer tool.
+
+CRITICAL OUTPUT RULE:
+Your final action is to write the RESEARCH REPORT as a plain text message.
+Do NOT call any tool named "report_results", "generate_report", "submit_report", or similar.
+There is no reporting tool. Just write the report text and stop.
 """
 
 

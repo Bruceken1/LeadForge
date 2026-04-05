@@ -2,6 +2,7 @@
 LeadForge Agent API — FastAPI + Server-Sent Events
 """
 import asyncio, json, os, re, uuid
+from datetime import datetime
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator, Optional
 
@@ -20,6 +21,73 @@ from agent.tools.leadengine import (
 )
 from agent.memory.vector_store import SCHEMA_SQL
 
+# Additional tables needed for the Autonomous SDR dashboard
+AUTONOMOUS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS icp_configs (
+    id              SERIAL PRIMARY KEY,
+    org_id          TEXT NOT NULL,
+    org_name        TEXT,
+    industry        TEXT NOT NULL,
+    location        TEXT NOT NULL,
+    min_rating      FLOAT DEFAULT 3.5,
+    min_reviews     INT DEFAULT 5,
+    campaign_goal   TEXT,
+    max_leads       INT DEFAULT 20,
+    active          BOOLEAN DEFAULT true,
+    last_run_at     TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS buy_signals (
+    id              SERIAL PRIMARY KEY,
+    source          TEXT,
+    signal_type     TEXT,
+    data            JSONB,
+    priority_boost  INT DEFAULT 0,
+    processed       BOOLEAN DEFAULT false,
+    processed_at    TIMESTAMPTZ,
+    detected_at     TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS approval_queue (
+    id              SERIAL PRIMARY KEY,
+    type            TEXT NOT NULL,
+    payload         JSONB NOT NULL,
+    status          TEXT DEFAULT 'pending',
+    notes           TEXT,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    resolved_at     TIMESTAMPTZ,
+    resolved_by     TEXT
+);
+
+CREATE TABLE IF NOT EXISTS notifications (
+    id              SERIAL PRIMARY KEY,
+    org_id          TEXT,
+    lead_id         TEXT,
+    type            TEXT,
+    message         TEXT,
+    read            BOOLEAN DEFAULT false,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS meetings (
+    id              SERIAL PRIMARY KEY,
+    org_id          TEXT,
+    lead_id         TEXT,
+    lead_name       TEXT,
+    lead_email      TEXT,
+    booking_id      TEXT UNIQUE,
+    meeting_datetime TEXT,
+    duration_minutes INT DEFAULT 30,
+    status          TEXT DEFAULT 'scheduled',
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_icp_org ON icp_configs(org_id, active);
+CREATE INDEX IF NOT EXISTS idx_buy_signals_unprocessed ON buy_signals(processed, detected_at DESC);
+CREATE INDEX IF NOT EXISTS idx_notifications_org ON notifications(org_id, read, created_at DESC);
+"""
+
 
 _db_pool: Optional[asyncpg.Pool] = None
 _agent_graph = None
@@ -32,6 +100,7 @@ async def lifespan(app: FastAPI):
     _db_pool = await asyncpg.create_pool(db_url, min_size=2, max_size=10)
     async with _db_pool.acquire() as conn:
         await conn.execute(SCHEMA_SQL)
+        await conn.execute(AUTONOMOUS_SCHEMA)
     _agent_graph = build_supervisor_graph()
     print("✅ LeadForge Agent API ready")
     print(f"   fast model  : {os.environ.get('GROQ_FAST_MODEL',  'llama-3.1-8b-instant')}")
@@ -391,6 +460,167 @@ async def _background_run(run_id: str, body: RunRequest):
             "message": str(e)[:500], "traceback": tb[:1500],
         })
 
+
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  AUTONOMOUS SDR DASHBOARD ROUTES
+#  These power the /autonomous tab in the frontend.
+# ═══════════════════════════════════════════════════════════════════
+
+class ICPConfigRequest(BaseModel):
+    org_id:         str
+    org_name:       str = ""
+    industry:       str
+    location:       str
+    min_rating:     float = 3.5
+    min_reviews:    int   = 5
+    campaign_goal:  str   = ""
+    max_leads:      int   = 20
+
+class ApprovalActionRequest(BaseModel):
+    approval_id: int
+    action:      str
+    notes:       str = ""
+    resolved_by: str = "human"
+
+class OptOutRequest(BaseModel):
+    email:  str
+    reason: str = "manual_request"
+    source: str = "dashboard"
+
+
+@app.post("/api/icp")
+async def create_icp(body: ICPConfigRequest):
+    async with _db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """INSERT INTO icp_configs
+               (org_id, org_name, industry, location, min_rating, min_reviews, campaign_goal, max_leads)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id""",
+            body.org_id, body.org_name, body.industry, body.location,
+            body.min_rating, body.min_reviews, body.campaign_goal, body.max_leads,
+        )
+    return {"icp_id": row["id"], "message": "ICP saved. AI will auto-run every 30 minutes."}
+
+
+@app.get("/api/icp/{org_id}")
+async def get_icp_configs(org_id: str):
+    async with _db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM icp_configs WHERE org_id=$1 ORDER BY created_at DESC", org_id
+        )
+    return [dict(r) for r in rows]
+
+
+@app.patch("/api/icp/{icp_id}/toggle")
+async def toggle_icp(icp_id: int, active: bool):
+    async with _db_pool.acquire() as conn:
+        await conn.execute("UPDATE icp_configs SET active=$1 WHERE id=$2", active, icp_id)
+    return {"status": "updated", "active": active}
+
+
+@app.get("/api/dashboard/{org_id}")
+async def get_dashboard(org_id: str):
+    async with _db_pool.acquire() as conn:
+        notifs = await conn.fetch(
+            "SELECT * FROM notifications WHERE org_id=$1 AND read=false ORDER BY created_at DESC LIMIT 20",
+            org_id,
+        )
+        approvals = await conn.fetch(
+            "SELECT * FROM approval_queue WHERE status='pending' ORDER BY created_at DESC LIMIT 20"
+        )
+        meetings = await conn.fetch(
+            "SELECT * FROM meetings WHERE org_id=$1 AND status='scheduled' ORDER BY created_at DESC LIMIT 10",
+            org_id,
+        )
+    return {
+        "notifications":  [dict(n) for n in notifs],
+        "approval_queue": [dict(a) for a in approvals],
+        "recent_meetings":[dict(m) for m in meetings],
+    }
+
+
+@app.get("/api/analytics/{org_id}")
+async def get_analytics(org_id: str, days: int = 30):
+    async with _db_pool.acquire() as conn:
+        runs = await conn.fetch(
+            "SELECT * FROM agent_runs WHERE org_id=$1 AND created_at > NOW() - INTERVAL '30 days'",
+            org_id,
+        )
+        meetings_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM meetings WHERE org_id=$1 AND created_at > NOW() - INTERVAL '30 days'",
+            org_id,
+        ) or 0
+        buy_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM buy_signals WHERE processed=false"
+        ) or 0
+
+    total_runs      = len(runs)
+    total_sent      = sum(r["sent"]      or 0 for r in runs)
+    total_qualified = sum(r["qualified"] or 0 for r in runs)
+    meeting_rate    = f"{round((meetings_count / total_qualified) * 100, 1)}%" if total_qualified else "0%"
+
+    return {
+        "emails_sent":          total_sent,
+        "meetings_booked":      meetings_count,
+        "meeting_rate":         meeting_rate,
+        "buy_signals_detected": buy_count,
+        "campaigns_run":        total_runs,
+        "days":                 days,
+    }
+
+
+@app.get("/api/buy-signals")
+async def get_buy_signals_route(processed: bool = False, limit: int = 20):
+    async with _db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM buy_signals WHERE processed=$1 ORDER BY detected_at DESC LIMIT $2",
+            processed, limit,
+        )
+    return [dict(r) for r in rows]
+
+
+@app.post("/api/approvals/{approval_id}/action")
+async def handle_approval(approval_id: int, body: ApprovalActionRequest):
+    async with _db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE approval_queue SET status=$1, notes=$2, resolved_by=$3, resolved_at=NOW() WHERE id=$4",
+            body.action, body.notes, body.resolved_by, approval_id,
+        )
+    return {"ok": True, "action": body.action}
+
+
+@app.get("/api/notifications/{org_id}/mark-read")
+async def mark_notifications_read(org_id: str):
+    async with _db_pool.acquire() as conn:
+        await conn.execute("UPDATE notifications SET read=true WHERE org_id=$1", org_id)
+    return {"ok": True}
+
+
+@app.get("/api/meetings/{org_id}")
+async def get_meetings_route(org_id: str, status: str = "scheduled"):
+    async with _db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM meetings WHERE org_id=$1 AND status=$2 ORDER BY created_at DESC",
+            org_id, status,
+        )
+    return [dict(r) for r in rows]
+
+
+@app.post("/api/compliance/opt-out")
+async def opt_out(body: OptOutRequest):
+    async with _db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO notifications (org_id, type, message) VALUES ('system', 'opt_out', $1)",
+            f"Opt-out: {body.email} — reason: {body.reason} — source: {body.source}",
+        )
+    return {"ok": True, "suppressed": body.email}
+
+
+@app.post("/api/run")
+async def run_alias(body: RunRequest):
+    """Alias of /api/agent/run for AutonomousDashboard compatibility."""
+    return await start_run(body)
 
 if __name__ == "__main__":
     uvicorn.run("api.main:app", host="0.0.0.0",

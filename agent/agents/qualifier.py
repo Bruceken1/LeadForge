@@ -57,8 +57,8 @@ def score_lead(
     city: str,
     rating: float,
     review_count: int,
-    has_email: bool,
-    has_phone: bool,
+    has_email: str,
+    has_phone: str,
     website_description: str,
     icp_industry: str,
     icp_location: str,
@@ -67,7 +67,16 @@ def score_lead(
     """
     Score a lead against the ICP using a deterministic rubric (0-100).
     Returns score, QUALIFIED/REJECTED decision, priority, HIGH_VALUE flag, and top reasons.
+
+    has_email and has_phone accept "true"/"false" strings or bool — Groq sometimes
+    sends Python True/False which breaks JSON schema validation. Accepting str fixes this.
     """
+    def _b(v) -> bool:
+        if isinstance(v, bool): return v
+        return str(v).strip().lower() in ("true", "1", "yes")
+    has_email = _b(has_email)
+    has_phone = _b(has_phone)
+
     score = 0
     reasons = []
 
