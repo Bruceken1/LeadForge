@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator, Optional
 
 import asyncpg, uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -96,21 +96,76 @@ _agent_graph = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _db_pool, _agent_graph
-    db_url = os.environ.get("DATABASE_URL", "postgresql://leadforge:leadforge@localhost:5432/leadforge")
-    _db_pool = await asyncpg.create_pool(db_url, min_size=2, max_size=10)
-    async with _db_pool.acquire() as conn:
-        await conn.execute(SCHEMA_SQL)
-        await conn.execute(AUTONOMOUS_SCHEMA)
-    _agent_graph = build_supervisor_graph()
-    print("✅ LeadForge Agent API ready")
+
+    startup_errors: list[str] = []
+
+    # ── Database ──────────────────────────────────────────────────────────────
+    db_url = os.environ.get("DATABASE_URL", "")
+    if not db_url:
+        startup_errors.append("DATABASE_URL not set — database features disabled")
+        print("⚠️  DATABASE_URL not set")
+    else:
+        try:
+            _db_pool = await asyncpg.create_pool(db_url, min_size=2, max_size=10,
+                                                  timeout=10, command_timeout=30)
+            async with _db_pool.acquire() as conn:
+                await conn.execute(SCHEMA_SQL)
+                await conn.execute(AUTONOMOUS_SCHEMA)
+            print("✅ Database connected")
+        except Exception as e:
+            startup_errors.append(f"Database connection failed: {e}")
+            print(f"⚠️  Database error (non-fatal): {e}")
+            _db_pool = None
+
+    # ── Agent graph ────────────────────────────────────────────────────────────
+    groq_key = os.environ.get("GROQ_API_KEY", "")
+    if not groq_key:
+        startup_errors.append("GROQ_API_KEY not set — agent runs disabled")
+        print("⚠️  GROQ_API_KEY not set — /api/agent/run will return 503")
+    else:
+        try:
+            _agent_graph = build_supervisor_graph()
+            print("✅ Agent graph compiled")
+        except Exception as e:
+            startup_errors.append(f"Agent graph failed to build: {e}")
+            print(f"⚠️  Agent graph error (non-fatal): {e}")
+
+    if startup_errors:
+        print("⚠️  Started with degraded functionality:")
+        for err in startup_errors:
+            print(f"   • {err}")
+    else:
+        print("✅ LeadForge Agent API ready")
+
     print(f"   fast model  : {os.environ.get('GROQ_FAST_MODEL',  'llama-3.1-8b-instant')}")
     print(f"   smart model : {os.environ.get('GROQ_SMART_MODEL', 'llama-3.3-70b-versatile')}")
+    app.state.startup_errors = startup_errors
+
     yield
-    await _db_pool.close()
+
+    if _db_pool:
+        await _db_pool.close()
 
 
 app = FastAPI(title="LeadForge Agent API", version="1.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+def require_db():
+    """Raise 503 if database is not connected."""
+    if not _db_pool:
+        raise HTTPException(
+            status_code=503,
+            detail="Database not connected. Set DATABASE_URL in environment variables.",
+        )
+
+def require_graph():
+    """Raise 503 if agent graph is not loaded."""
+    if not _agent_graph:
+        raise HTTPException(
+            status_code=503,
+            detail="Agent graph not loaded. Set GROQ_API_KEY in environment variables.",
+        )
 
 
 class ICP(BaseModel):
@@ -136,6 +191,9 @@ class ApproveRequest(BaseModel):
 
 
 async def _log(run_id: str, agent: str, event_type: str, data: dict):
+    if not _db_pool:
+        print(f"[{run_id}][{agent}] {event_type}: {str(data)[:120]}")
+        return
     try:
         async with _db_pool.acquire() as conn:
             await conn.execute(
@@ -147,6 +205,9 @@ async def _log(run_id: str, agent: str, event_type: str, data: dict):
 
 
 async def _set_status(run_id: str, status: str, extra: dict = {}):
+    if not _db_pool:
+        print(f"[{run_id}] status → {status}")
+        return
     try:
         async with _db_pool.acquire() as conn:
             if extra:
@@ -217,7 +278,7 @@ def _parse_outreach_packages(messages: list) -> list[dict]:
             return m.group(1).strip() if m else ""
 
         pkg["lead_id"]  = _field(r"lead_id[:\s]+(\S+)", block)
-        pkg["name"]     = _field(r"name[:\s]+(.+?)(?:\n|email)", block)
+        pkg["name"]     = _field(r"(?:company|name)[:\s]+([^\n]{1,80})", block)
         pkg["email"]    = _field(r"email[:\s]+(\S+@\S+)", block)
         pkg["phone"]    = _field(r"phone[:\s]+(\+?\d[\d\s]+)", block)
         pkg["subject"]  = _field(r"EMAIL_SUBJECT[:\s]+(.+?)(?:\n)", block)
@@ -231,14 +292,29 @@ def _parse_outreach_packages(messages: list) -> list[dict]:
 
 
 @app.get("/health")
-async def health():
-    return {"status": "ok",
-            "fast_model":  os.environ.get("GROQ_FAST_MODEL",  "llama-3.1-8b-instant"),
-            "smart_model": os.environ.get("GROQ_SMART_MODEL", "llama-3.3-70b-versatile")}
+async def health(request: Request):
+    startup_errors = getattr(request.app.state, "startup_errors", [])
+    return {
+        "status":       "degraded" if startup_errors else "healthy",
+        "version":      "1.0.0",
+        "database":     "connected" if _db_pool else "disconnected",
+        "agent_graph":  "loaded"    if _agent_graph else "unavailable",
+        "fast_model":   os.environ.get("GROQ_FAST_MODEL",  "llama-3.1-8b-instant"),
+        "smart_model":  os.environ.get("GROQ_SMART_MODEL", "llama-3.3-70b-versatile"),
+        "startup_errors": startup_errors,
+        "env_check": {
+            "DATABASE_URL":      bool(os.environ.get("DATABASE_URL")),
+            "GROQ_API_KEY":      bool(os.environ.get("GROQ_API_KEY")),
+            "RESEND_API_KEY":    bool(os.environ.get("RESEND_API_KEY")),
+            "LEADENGINE_API_URL": bool(os.environ.get("LEADENGINE_API_URL")),
+        },
+        "timestamp": datetime.utcnow().isoformat(),
+    }
 
 
 @app.post("/api/agent/run")
 async def start_run(body: RunRequest):
+    require_db(); require_graph()
     run_id = str(uuid.uuid4())
     configure_tools(body.leadengine_api_url, body.leadengine_token, body.org_id)
     async with _db_pool.acquire() as conn:
@@ -353,7 +429,7 @@ async def _execute_outreach(run_id: str, packages: list[dict], sender_email: str
             )
             await _log(run_id, "executor_agent", "tool_result",
                        {"content": f"Email to {email}: {result}"})
-            if "Message ID" in result or "sent" in result.lower():
+            if "ID:" in result or "sent" in result.lower():
                 emails_sent += 1
                 if lead_id:
                     update_lead_status.func(lead_id=lead_id, status="contacted")
@@ -396,7 +472,7 @@ async def _background_run(run_id: str, body: RunRequest):
             f"Run the 3-step pipeline: research_agent → qualifier_agent → personalization_agent."
         )
 
-        config = {"configurable": {"thread_id": run_id}, "recursion_limit": 25}
+        config = {"configurable": {"thread_id": run_id}, "recursion_limit": 60}
 
         await _log(run_id, "supervisor", "started", {
             "goal": body.campaign_goal, "icp": body.icp.dict(),
