@@ -622,6 +622,18 @@ async def run_alias(body: RunRequest):
     """Alias of /api/agent/run for AutonomousDashboard compatibility."""
     return await start_run(body)
 
+
+@app.get("/api/runs/{run_id}/stream")
+async def stream_alias(run_id: str):
+    """Alias of /api/agent/stream/{run_id} for AutonomousDashboard compatibility."""
+    return await stream_events(run_id)
+
+
+@app.get("/api/runs/{run_id}")
+async def get_run_alias(run_id: str):
+    """Alias of /api/agent/run/{run_id} for AutonomousDashboard compatibility."""
+    return await get_run(run_id)
+
 if __name__ == "__main__":
     uvicorn.run("api.main:app", host="0.0.0.0",
                 port=int(os.environ.get("PORT", 8000)), reload=False, workers=1)
