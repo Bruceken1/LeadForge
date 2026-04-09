@@ -1,0 +1,36 @@
+{
+  "name": "lead-engine-worker",
+  "version": "5.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:create": "wrangler d1 create lead-engine-db",
+    "db:migrate": "wrangler d1 execute lead-engine-db --file=schema.sql --remote",
+    "db:migrate:local": "wrangler d1 execute lead-engine-db --file=schema.sql",
+    "secret:jwt": "wrangler secret put JWT_SECRET",
+    "secret:google-id": "wrangler secret put GOOGLE_CLIENT_ID",
+    "secret:google-sec": "wrangler secret put GOOGLE_CLIENT_SECRET",
+    "secret:serpapi": "wrangler secret put SERPAPI_KEY",
+    "secret:gemini": "wrangler secret put GEMINI_API_KEY",
+    "secret:apollo": "wrangler secret put APOLLO_API_KEY",
+    "secret:hunter": "wrangler secret put HUNTER_API_KEY",
+    "secret:resend": "wrangler secret put RESEND_API_KEY",
+    "secrets": "npm run secret:jwt && npm run secret:google-id && npm run secret:google-sec && npm run secret:serpapi && npm run secret:gemini && npm run secret:apollo && npm run secret:hunter && npm run secret:resend && npm run secret:sender-email && npm run secret:sender-name && npm run secret:admin",
+    "secret:twilio-sid": "wrangler secret put TWILIO_ACCOUNT_SID",
+    "secret:twilio-auth": "wrangler secret put TWILIO_AUTH_TOKEN",
+    "secret:twilio-from": "wrangler secret put TWILIO_WHATSAPP_FROM",
+    "secrets:whatsapp": "npm run secret:twilio-sid && npm run secret:twilio-auth && npm run secret:twilio-from",
+    "secret:admin": "wrangler secret put ADMIN_EMAIL",
+    "secret:sender-email": "wrangler secret put SENDER_EMAIL",
+    "secret:sender-name": "wrangler secret put SENDER_NAME",
+    "secret:paystack-secret": "wrangler secret put PAYSTACK_SECRET_KEY",
+    "secret:paystack-public": "wrangler secret put PAYSTACK_PUBLIC_KEY",
+    "secrets:paystack": "npm run secret:paystack-secret && npm run secret:paystack-public"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241218.0",
+    "typescript": "^5.8.3",
+    "wrangler": "^3.101.0"
+  }
+}

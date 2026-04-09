@@ -1,0 +1,78 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Space+Mono:wght@400;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: 222 20% 7%;
+  --foreground: 210 20% 95%;
+  --card: 222 18% 10%;
+  --card-foreground: 210 20% 95%;
+  --popover: 222 18% 10%;
+  --popover-foreground: 210 20% 95%;
+  --primary: 43 96% 56%;
+  --primary-foreground: 222 20% 7%;
+  --secondary: 222 15% 16%;
+  --secondary-foreground: 210 20% 80%;
+  --muted: 222 15% 14%;
+  --muted-foreground: 215 15% 55%;
+  --accent: 43 96% 56%;
+  --accent-foreground: 222 20% 7%;
+  --destructive: 0 72% 51%;
+  --destructive-foreground: 0 0% 98%;
+  --success: 142 71% 45%;
+  --warning: 38 92% 50%;
+  --border: 222 15% 18%;
+  --input: 222 15% 16%;
+  --ring: 43 96% 56%;
+  --radius: 0.75rem;
+  --sidebar-background: 222 22% 6%;
+  --sidebar-foreground: 210 20% 85%;
+  --sidebar-border: 222 15% 14%;
+  --sidebar-accent: 222 15% 13%;
+  --sidebar-accent-foreground: 210 20% 95%;
+  --sidebar-primary: 43 96% 56%;
+  --sidebar-primary-foreground: 222 20% 7%;
+  --sidebar-ring: 43 96% 56%;
+}
+
+* { border-color: hsl(var(--border)); }
+
+body {
+  font-family: 'DM Sans', system-ui, -apple-system, sans-serif;
+  background-color: hsl(var(--background));
+  color: hsl(var(--foreground));
+  -webkit-font-smoothing: antialiased;
+}
+
+.glass-card {
+  background-color: hsl(var(--card));
+  border: 1px solid hsl(var(--border));
+  box-shadow: 0 2px 8px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.04);
+  border-radius: var(--radius);
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.glass-card:hover {
+  border-color: hsl(43 96% 56% / 0.3);
+  box-shadow: 0 4px 20px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.06);
+}
+
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background-image:
+    linear-gradient(hsl(222 20% 12% / 0.35) 1px, transparent 1px),
+    linear-gradient(90deg, hsl(222 20% 12% / 0.35) 1px, transparent 1px);
+  background-size: 48px 48px;
+  pointer-events: none;
+  z-index: 0;
+}
+
+#root { position: relative; z-index: 1; }
+
+.gradient-gold {
+  background: linear-gradient(135deg, hsl(43, 96%, 56%) 0%, hsl(32, 90%, 50%) 100%);
+}

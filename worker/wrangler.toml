@@ -1,0 +1,38 @@
+name = "lead-engine-backend"
+main = "index.ts"
+compatibility_date = "2025-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+FRONTEND_URL     = "https://app.leadengine.dime-solutions.co.ke"
+FRONTEND_URL_ALT = "https://leadengine.dime-solutions.co.ke"
+APP_DOMAIN       = "app.leadengine.dime-solutions.co.ke"
+
+[[d1_databases]]
+binding       = "DB"
+database_name = "lead-engine-db"
+database_id   = "ec0d9cbc-c527-48c8-ab9a-7d67199d9b28"
+
+# Secrets (set via npm run secrets):
+# JWT_SECRET
+# GOOGLE_CLIENT_ID
+# GOOGLE_CLIENT_SECRET
+# SERPAPI_KEY
+# GEMINI_API_KEY
+# APOLLO_API_KEY
+# HUNTER_API_KEY
+# RESEND_API_KEY
+# SENDER_EMAIL                 — fallback from email for agent outreach (must be verified in Resend)
+# SENDER_NAME                  — fallback display name for agent outreach
+# TWILIO_ACCOUNT_SID           (optional — only needed for WhatsApp campaigns)
+# TWILIO_AUTH_TOKEN            (optional)
+# TWILIO_WHATSAPP_FROM         (optional — e.g. whatsapp:+14155238886)
+# ADMIN_EMAIL                  — superuser email with unlimited credits
+# PAYSTACK_SECRET_KEY          — sk_live_... from paystack.com dashboard
+# PAYSTACK_PUBLIC_KEY          — pk_live_... from paystack.com dashboard
+
+[triggers]
+crons = ["0 6 * * *"]
+
+[dev]
+port = 8787

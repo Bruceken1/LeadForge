@@ -710,6 +710,160 @@ async def get_run_alias(run_id: str):
     """Alias of /api/agent/run/{run_id} for AutonomousDashboard compatibility."""
     return await get_run(run_id)
 
+
+# ─── Session endpoints (AutonomousDashboard v2 uses /api/session) ─────────────
+# The v2 frontend calls /api/session instead of /api/run.
+# These endpoints are thin wrappers around the existing run-based logic so we
+# don't need to change anything else in the codebase.
+
+class SessionRequest(BaseModel):
+    """Mirrors RunRequest — accepts the extra fields the v2 frontend sends."""
+    campaign_goal:      str
+    icp:                ICP
+    org_id:             str
+    org_name:           str
+    leadengine_api_url: str
+    leadengine_token:   str
+    max_leads:          int = 20
+    loop_interval:      int = 60   # ignored for now, kept for API compatibility
+
+
+@app.post("/api/session")
+async def start_session(body: SessionRequest):
+    """
+    V2 AutonomousDashboard launches campaigns via POST /api/session.
+    Converts to a RunRequest and delegates to start_run().
+    Returns session_id (same value as run_id internally).
+    """
+    run_req = RunRequest(
+        campaign_goal      = body.campaign_goal,
+        icp                = body.icp,
+        org_id             = body.org_id,
+        org_name           = body.org_name,
+        leadengine_api_url = body.leadengine_api_url,
+        leadengine_token   = body.leadengine_token,
+        max_leads          = body.max_leads,
+    )
+    result = await start_run(run_req)
+    # Frontend expects session_id, server returns run_id — map it
+    return {
+        "session_id": result["run_id"],
+        "status":     result["status"],
+        "message":    "Session started — pipeline running.",
+    }
+
+
+@app.get("/api/session/{session_id}")
+async def get_session(session_id: str):
+    """
+    V2 frontend polls this to get session stats (total_runs, emails_sent, status).
+    Maps to the agent_run row, adding session-compatible field names.
+    """
+    require_db()
+    async with _db_pool.acquire() as conn:
+        run = await conn.fetchrow("SELECT * FROM agent_runs WHERE id=$1", session_id)
+        if not run:
+            raise HTTPException(status_code=404, detail="Session not found")
+        run_dict = dict(run)
+    return {
+        "session_id":   session_id,
+        "status":       run_dict.get("status", "unknown"),
+        "campaign_goal":run_dict.get("campaign_goal", ""),
+        "total_runs":   1,                              # single-shot run = 1 loop
+        "emails_sent":  run_dict.get("sent", 0) or 0,
+        "whatsapp_sent":0,
+        "stop_reason":  run_dict.get("error_message", ""),
+        "created_at":   run_dict.get("created_at", "").isoformat() if run_dict.get("created_at") else "",
+        "stopped_at":   run_dict.get("updated_at", "").isoformat() if run_dict.get("updated_at") else "",
+    }
+
+
+@app.delete("/api/session/{session_id}")
+async def stop_session(session_id: str):
+    """V2 frontend stops a session via DELETE /api/session/{id}."""
+    require_db()
+    await _set_status(session_id, "cancelled")
+    return {"session_id": session_id, "status": "stopped"}
+
+
+@app.get("/api/session/{session_id}/stream")
+async def stream_session(session_id: str):
+    """
+    V2 frontend connects EventSource to /api/session/{id}/stream.
+    Proxies to stream_events() and emits session_stopped when the run finishes
+    so the frontend SSE handler closes cleanly.
+    """
+    require_db()
+
+    async def gen() -> AsyncGenerator[str, None]:
+        last_id = 0
+        while True:
+            async with _db_pool.acquire() as conn:
+                run = await conn.fetchrow(
+                    "SELECT status, sent FROM agent_runs WHERE id=$1", session_id
+                )
+                if not run:
+                    yield f"data: {json.dumps({'type':'error','message':'session not found'})}\n\n"
+                    return
+                rows = await conn.fetch(
+                    "SELECT id, agent, event_type, data, created_at "
+                    "FROM agent_events WHERE run_id=$1 AND id>$2 ORDER BY id",
+                    session_id, last_id,
+                )
+                for r in rows:
+                    last_id = r["id"]
+                    evt = {
+                        "type":      r["event_type"],
+                        "agent":     r["agent"],
+                        "data":      json.loads(r["data"] or "{}"),
+                        "ts":        r["created_at"].isoformat(),
+                    }
+                    yield f"data: {json.dumps(evt)}\n\n"
+                status = run["status"]
+                if status in ("completed", "failed", "cancelled"):
+                    stopped_evt = {
+                        "type":        "session_stopped",
+                        "status":      status,
+                        "total_runs":  1,
+                        "emails_sent": run["sent"] or 0,
+                    }
+                    yield f"data: {json.dumps(stopped_evt)}\n\n"
+                    return
+            await asyncio.sleep(1)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/sessions/{org_id}")
+async def list_sessions(org_id: str):
+    """
+    V2 frontend fetches active sessions to show in Overview/sidebar.
+    Maps agent_runs to session-shaped objects.
+    """
+    require_db()
+    async with _db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM agent_runs WHERE org_id=$1 ORDER BY created_at DESC LIMIT 20",
+            org_id,
+        )
+    return [
+        {
+            "session_id":    r["id"],
+            "status":        r["status"],
+            "campaign_goal": r["campaign_goal"] or "",
+            "total_runs":    1,
+            "emails_sent":   r["sent"] or 0,
+            "whatsapp_sent": 0,
+            "created_at":    r["created_at"].isoformat() if r["created_at"] else "",
+        }
+        for r in rows
+    ]
+
+
 if __name__ == "__main__":
     uvicorn.run("api.main:app", host="0.0.0.0",
                 port=int(os.environ.get("PORT", 8000)), reload=False, workers=1)
