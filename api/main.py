@@ -251,41 +251,61 @@ def _extract_content(msg: Any) -> str:
 
 def _parse_outreach_packages(messages: list) -> list[dict]:
     """
-    Parse outreach packages directly from the personalization agent's message text.
-    Returns list of dicts with lead_id, name, email, phone, subject, body, whatsapp.
+    Parse outreach packages from the personalization agent's messages.
+    Handles both:
+      - '=== OUTREACH PACKAGE ===' (prompt format)
+      - '=== OUTREACH: <NAME> ===' (what the LLM actually writes)
+    Does NOT require an email address — phone-only leads get WhatsApp outreach.
     """
     packages = []
     full_text = ""
+
+    # Collect all personalization agent messages
     for msg in messages:
         name = getattr(msg, "name", "") or ""
         if "personalization" in name or "personalizer" in name:
             full_text += _extract_content(msg) + "\n"
 
+    # Fallback: scan all messages for anything containing outreach markers
     if not full_text:
-        # Fall back to scanning all messages for outreach packages
         for msg in messages:
             content = _extract_content(msg)
-            if "EMAIL_SUBJECT" in content or "OUTREACH PACKAGE" in content:
+            if "EMAIL_SUBJECT" in content or "OUTREACH PACKAGE" in content or "OUTREACH:" in content:
                 full_text += content + "\n"
 
-    # Split into individual packages
-    blocks = re.split(r"===\s*OUTREACH PACKAGE\s*===", full_text)
-    for block in blocks[1:]:  # skip text before first package
+    if not full_text:
+        return []
+
+    # Split on either delimiter pattern the LLM uses
+    blocks = re.split(r"===\s*OUTREACH(?:\s*PACKAGE|\s*:[^=]+)?\s*===", full_text)
+
+    for block in blocks[1:]:  # first element is text before first delimiter
+        if not block.strip():
+            continue
+
         pkg = {}
 
-        def _field(pattern, text):
+        def _field(pattern, text, default=""):
             m = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
-            return m.group(1).strip() if m else ""
+            return m.group(1).strip() if m else default
 
         pkg["lead_id"]  = _field(r"lead_id[:\s]+(\S+)", block)
-        pkg["name"]     = _field(r"(?:company|name)[:\s]+([^\n]{1,80})", block)
-        pkg["email"]    = _field(r"email[:\s]+(\S+@\S+)", block)
-        pkg["phone"]    = _field(r"phone[:\s]+(\+?\d[\d\s]+)", block)
+        pkg["name"]     = _field(r"(?:^name|company)[:\s]+([^\n]{1,80})", block)
+        pkg["email"]    = _field(r"email[:\s]+([\w.+-]+@[\w.-]+\.\w+)", block)
+        pkg["phone"]    = _field(r"phone[:\s]+([+\d][\d\s\-()]{5,20})", block)
         pkg["subject"]  = _field(r"EMAIL_SUBJECT[:\s]+(.+?)(?:\n)", block)
-        pkg["body"]     = _field(r"EMAIL_BODY[:\s]+(.+?)(?:WHATSAPP|FOLLOW_UP|={3})", block)
-        pkg["whatsapp"] = _field(r"WHATSAPP[:\s]+(.+?)(?:FOLLOW_UP|={3}|$)", block)
+        pkg["body"]     = _field(r"EMAIL_BODY[:\s]*\n(.+?)(?:\nWHATSAPP|\nFOLLOW_UP|={3}|$)", block)
+        pkg["whatsapp"] = _field(r"WHATSAPP[:\s]*\n(.+?)(?:\nFOLLOW_UP|={3}|$)", block)
 
-        if pkg.get("email") and "@" in pkg["email"]:
+        # Accept package if it has email OR phone — either channel can be used
+        has_contact = (pkg.get("email") and "@" in pkg["email"]) or \
+                      (pkg.get("phone") and len(pkg["phone"].strip()) >= 6)
+
+        # Also accept if we have a subject/body even without confirmed contact
+        # (the executor will skip sending if truly no contact info)
+        has_content = pkg.get("subject") or pkg.get("body")
+
+        if has_contact or has_content:
             packages.append(pkg)
 
     return packages
@@ -464,57 +484,93 @@ async def _background_run(run_id: str, body: RunRequest):
         sender_email = os.environ.get("SENDER_EMAIL", "outreach@dime-solutions.co.ke")
         sender_name  = os.environ.get("SENDER_NAME",  "Dimes Solutions")
 
-        user_message = (
+        agents = _agent_graph  # dict: {"research", "qualifier", "personalizer"}
+
+        brief = (
             f"Campaign: {body.campaign_goal}\n"
             f"Industry: {body.icp.industry} | Location: {body.icp.location} | "
             f"Max leads: {body.max_leads} | Min rating: {body.icp.min_rating}\n"
-            f"Org: {body.org_name}\n\n"
-            f"Run the 3-step pipeline: research_agent → qualifier_agent → personalization_agent."
+            f"Org: {body.org_name}"
         )
-
-        config = {"configurable": {"thread_id": run_id}, "recursion_limit": 30}
 
         await _log(run_id, "supervisor", "started", {
             "goal": body.campaign_goal, "icp": body.icp.dict(),
         })
-        print(f"[{run_id}] Starting 3-step pipeline")
+        print(f"[{run_id}] Starting 3-step sequential pipeline")
 
         all_messages = []
-        chunk_count = 0
 
-        async for chunk in _agent_graph.astream(
-            {"messages": [{"role": "user", "content": user_message}]},
-            config=config,
-            stream_mode="updates",
-        ):
-            chunk_count += 1
-            if chunk_count > 50:
-                print(f"[{run_id}] ⚠️  Hard chunk limit reached — breaking to prevent infinite loop")
-                await _log(run_id, "supervisor", "message",
-                           {"content": "Pipeline cut short: supervisor loop detected. Proceeding to outreach with collected data."})
-                break
-            for node_name, node_output in chunk.items():
-                if not isinstance(node_output, dict):
-                    continue
-                messages = node_output.get("messages", [])
-                all_messages.extend(messages)
-                for msg in messages:
-                    msg_type   = type(msg).__name__
-                    agent_name = (getattr(msg, "name", None) or node_name or "").strip() or node_name
-                    content    = _extract_content(msg)
-                    print(f"[{run_id}]  {agent_name}: {content[:150]!r}")
-                    if not content or msg_type == "HumanMessage":
+        async def _run_agent(agent_key: str, agent_name: str, prompt: str) -> str:
+            """Invoke one agent, log its messages, return its final text output."""
+            agent = agents[agent_key]
+            config = {"configurable": {"thread_id": f"{run_id}-{agent_key}"}, "recursion_limit": 25}
+
+            await _log(run_id, agent_name, "started", {"prompt_preview": prompt[:200]})
+            output_text = ""
+
+            async for chunk in agent.astream(
+                {"messages": [{"role": "user", "content": prompt}]},
+                config=config,
+                stream_mode="updates",
+            ):
+                for node_name, node_output in chunk.items():
+                    if not isinstance(node_output, dict):
                         continue
-                    event_type = (
-                        "tool_result" if msg_type == "ToolMessage"
-                        else "tool_call" if getattr(msg, "tool_calls", None)
-                        else "message"
-                    )
-                    await _log(run_id, agent_name, event_type, {"content": content[:2000]})
+                    msgs = node_output.get("messages", [])
+                    all_messages.extend(msgs)
+                    for msg in msgs:
+                        msg_type   = type(msg).__name__
+                        agent_label = (getattr(msg, "name", None) or node_name or agent_name).strip()
+                        content    = _extract_content(msg)
+                        if content:
+                            print(f"[{run_id}]  {agent_label}: {content[:150]!r}")
+                        if not content or msg_type == "HumanMessage":
+                            continue
+                        event_type = (
+                            "tool_result" if msg_type == "ToolMessage"
+                            else "tool_call" if getattr(msg, "tool_calls", None)
+                            else "message"
+                        )
+                        await _log(run_id, agent_label, event_type, {"content": content[:2000]})
+                        if msg_type == "AIMessage" and not getattr(msg, "tool_calls", None):
+                            output_text = content  # last non-tool AI message = final answer
 
-        print(f"[{run_id}] Pipeline done ({chunk_count} chunks). Executing outreach directly...")
+            return output_text
 
-        # Parse packages and execute sends in Python — no LLM
+        # ── Step 1: Research ────────────────────────────────────────────────
+        research_prompt = (
+            f"{brief}\n\n"
+            f"Scrape Google Maps for '{body.icp.industry}' in '{body.icp.location}'. "
+            f"Find up to {body.max_leads} businesses. Enrich emails where possible. "
+            f"Return the RESEARCH REPORT."
+        )
+        research_report = await _run_agent("research", "research_agent", research_prompt)
+        print(f"[{run_id}] Research complete — {len(research_report)} chars")
+
+        # ── Step 2: Qualify ─────────────────────────────────────────────────
+        qualify_prompt = (
+            f"{brief}\n\n"
+            f"Here is the RESEARCH REPORT from the research agent:\n\n{research_report}\n\n"
+            f"Score every lead. Use score_lead() for each one. "
+            f"Return the QUALIFICATION SUMMARY with QUALIFIED LEAD DETAILS."
+        )
+        qualification_report = await _run_agent("qualifier", "qualifier_agent", qualify_prompt)
+        print(f"[{run_id}] Qualification complete — {len(qualification_report)} chars")
+
+        # ── Step 3: Personalize ─────────────────────────────────────────────
+        personalize_prompt = (
+            f"{brief}\n\n"
+            f"Here are the QUALIFIED LEADS from the qualifier:\n\n{qualification_report}\n\n"
+            f"Write personalized outreach for every QUALIFIED lead. "
+            f"Use generate_outreach_brief() and get_local_context() for each. "
+            f"Return all OUTREACH PACKAGES in the exact format specified."
+        )
+        personalization_report = await _run_agent("personalizer", "personalization_agent", personalize_prompt)
+        print(f"[{run_id}] Personalization complete — {len(personalization_report)} chars")
+
+        await _log(run_id, "supervisor", "message", {"content": "3-step pipeline complete. Parsing outreach packages."})
+
+        # ── Execute outreach ─────────────────────────────────────────────────
         packages = _parse_outreach_packages(all_messages)
         print(f"[{run_id}] Found {len(packages)} outreach packages to send")
 
