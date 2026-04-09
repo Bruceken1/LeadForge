@@ -472,7 +472,7 @@ async def _background_run(run_id: str, body: RunRequest):
             f"Run the 3-step pipeline: research_agent → qualifier_agent → personalization_agent."
         )
 
-        config = {"configurable": {"thread_id": run_id}, "recursion_limit": 60}
+        config = {"configurable": {"thread_id": run_id}, "recursion_limit": 30}
 
         await _log(run_id, "supervisor", "started", {
             "goal": body.campaign_goal, "icp": body.icp.dict(),
@@ -488,6 +488,11 @@ async def _background_run(run_id: str, body: RunRequest):
             stream_mode="updates",
         ):
             chunk_count += 1
+            if chunk_count > 50:
+                print(f"[{run_id}] ⚠️  Hard chunk limit reached — breaking to prevent infinite loop")
+                await _log(run_id, "supervisor", "message",
+                           {"content": "Pipeline cut short: supervisor loop detected. Proceeding to outreach with collected data."})
+                break
             for node_name, node_output in chunk.items():
                 if not isinstance(node_output, dict):
                     continue

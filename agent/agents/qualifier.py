@@ -1,38 +1,61 @@
 """
-Qualifier Agent — Scores each lead against the ICP.
-Rejects weak leads, flags high-value ones for human review.
+Qualifier Agent — Scores leads against the ICP using a deterministic rubric.
 """
 from langgraph.prebuilt import create_react_agent
 from langchain_core.tools import tool
+from typing import Optional
 from agent.llm import get_fast_llm
 from agent.tools.leadengine import update_lead_status
 
 QUALIFIER_SYSTEM = """
-You are the Qualifier Agent for LeadForge. Your job is to score each lead
-against the Ideal Customer Profile (ICP) provided and make a binary decision:
-QUALIFY or REJECT.
+You are the Qualifier Agent for LeadForge. You score every lead from the RESEARCH REPORT
+against the ICP and decide QUALIFY or REJECT.
 
-Use the score_lead tool for EVERY lead you receive. It returns a structured
-score and decision based on real criteria — trust its output.
-Then call update_lead_status to persist the result in the CRM.
+MANDATORY WORKFLOW:
+1. For EVERY lead in the research report, call score_lead() with data from that report.
+   You MUST call score_lead for each lead — never skip a lead.
+2. For each QUALIFIED lead, call update_lead_status(lead_id=<integer>, status='new', notes='qualified').
+3. For each REJECTED lead, call update_lead_status(lead_id=<integer>, status='new', notes='rejected').
+4. Return the QUALIFICATION SUMMARY below.
 
-After scoring all leads, return a structured summary:
+IMPORTANT — NULL HANDLING:
+- If a lead has no website description, pass website_description="" (empty string, NOT null).
+- If a lead has no rating, pass rating=0.0 (NOT null).
+- If a lead has no review count, pass review_count=0 (NOT null).
+- If a lead has no email, pass has_email="false" (string, NOT null/bool).
+- If a lead has no phone, pass has_phone="false" (string, NOT null/bool).
+- NEVER pass null/None for any parameter — use the defaults above.
+
+OUTPUT FORMAT:
+
 QUALIFICATION SUMMARY
 ---------------------
 Total scored: X
-Qualified: Y  →  [name1, name2, ...]
-Rejected: Z   →  [name3, ...]
-High-value (score >=85, reviews>100, has email): [names if any]
+Qualified: Y  →  [list names]
+Rejected: Z   →  [list names]
+High-value (score >=85, reviews>100, has email): [names or 'none']
 
-Always produce this summary so the supervisor can route to the next step.
+QUALIFIED LEAD DETAILS (include for each qualified lead — needed by personalizer and executor):
+[For each qualified lead:]
+  lead_id: [integer — CRITICAL]
+  Name: [name]
+  Email: [email or 'none']
+  Phone: [phone or 'none']
+  City: [city]
+  Industry: [industry]
+  Rating: [rating]
+  Score: [score]/100
+  Description: [from research report]
+  Pain points: [from research report]
+  High-value: [yes/no]
 
-ANTI-FABRICATION RULES (MANDATORY — never break these):
-- NEVER invent, assume, or fabricate any data. Every piece of information you use must come from a tool call result.
-- NEVER write a summary, report, or status update before calling the required tools.
-- If a tool returns an error, report the error exactly. Do not pretend it succeeded.
-- If you do not have a required piece of data (e.g. email address, lead_id), call the appropriate tool to get it. Do not guess.
-- A Message ID or SID in the tool response is proof of a real action. No ID = nothing happened.
-- If you cannot complete a step because data is missing, say exactly what is missing and stop. Do not fabricate a workaround.
+When done, return your report text and stop. Do NOT call any handoff or transfer tool.
+
+ANTI-FABRICATION RULES (MANDATORY):
+- NEVER score a lead without calling score_lead(). The tool does the scoring — not you.
+- NEVER qualify a lead that was not in the research report.
+- NEVER fabricate a score. Use only the score returned by score_lead().
+- The lead_id must be the exact integer from the research report.
 """
 
 
@@ -51,96 +74,100 @@ def score_lead(
     campaign_goal: str,
 ) -> str:
     """
-    Score a lead against the ICP criteria using a deterministic rubric.
-    Returns a score (0-100), QUALIFIED/REJECTED decision, priority tier,
-    HIGH_VALUE flag, and the top 3 scoring reasons.
+    Score a lead against the ICP using a deterministic rubric (0-100).
+    Returns score, QUALIFIED/REJECTED decision, priority, HIGH_VALUE flag, and top reasons.
 
-    has_email and has_phone accept "true"/"false" strings or bool values.
+    Pass empty strings instead of null for optional text fields.
+    Pass 0 for missing numeric fields.
+    Pass "false" (string) for missing boolean fields.
     """
-    # Normalise booleans — Groq sometimes sends Python True/False as strings
-    def _bool(v) -> bool:
+    # Coerce nulls/Nones to safe defaults — belt-and-suspenders in case LLM still passes null
+    if rating is None:           rating = 0.0
+    if review_count is None:     review_count = 0
+    if website_description is None: website_description = ""
+    if has_email is None:        has_email = "false"
+    if has_phone is None:        has_phone = "false"
+    if industry is None:         industry = ""
+    if city is None:             city = ""
+
+    def _b(v) -> bool:
         if isinstance(v, bool): return v
         return str(v).strip().lower() in ("true", "1", "yes")
-    _has_email = _bool(has_email)
-    _has_phone = _bool(has_phone)
+
+    has_email_b = _b(has_email)
+    has_phone_b = _b(has_phone)
 
     score = 0
     reasons = []
 
     # 1. Industry match (0-20)
-    icp_ind_lower = icp_industry.lower()
-    lead_ind_lower = industry.lower()
-    if icp_ind_lower in lead_ind_lower or lead_ind_lower in icp_ind_lower:
+    icp_ind = (icp_industry or "").lower()
+    lead_ind = industry.lower()
+    if icp_ind and (icp_ind in lead_ind or lead_ind in icp_ind):
         score += 20
-        reasons.append(f"Industry match: '{industry}' aligns with target '{icp_industry}' (+20)")
-    elif any(word in lead_ind_lower for word in icp_ind_lower.split() if len(word) > 3):
+        reasons.append(f"Industry match: '{industry}' ↔ '{icp_industry}' (+20)")
+    elif icp_ind and any(w in lead_ind for w in icp_ind.split() if len(w) > 3):
         score += 10
-        reasons.append(f"Partial industry match: '{industry}' partially matches '{icp_industry}' (+10)")
+        reasons.append("Partial industry match (+10)")
     else:
-        reasons.append(f"Industry mismatch: '{industry}' vs target '{icp_industry}' (+0)")
+        reasons.append(f"Industry mismatch: '{industry}' vs '{icp_industry}' (+0)")
 
     # 2. Location match (0-20)
-    icp_loc_lower = icp_location.lower()
-    city_lower = city.lower()
-    icp_cities = [c.strip() for c in icp_loc_lower.replace(",", " ").split()]
-    if city_lower in icp_loc_lower or any(city_lower in c for c in icp_cities):
+    icp_loc = (icp_location or "").lower()
+    city_l = city.lower()
+    if icp_loc and (city_l in icp_loc or any(city_l in c for c in icp_loc.replace(",", " ").split())):
         score += 20
-        reasons.append(f"Location match: '{city}' is in target area '{icp_location}' (+20)")
-    elif any(c in city_lower for c in icp_cities if len(c) > 3):
-        score += 10
-        reasons.append(f"Partial location match: '{city}' near '{icp_location}' (+10)")
+        reasons.append(f"Location match: '{city}' in '{icp_location}' (+20)")
     else:
-        reasons.append(f"Location mismatch: '{city}' vs target '{icp_location}' (+0)")
+        reasons.append(f"Location mismatch: '{city}' vs '{icp_location}' (+0)")
 
-    # 3. Size signals — rating + review count (0-20)
+    # 3. Reputation signals (0-20)
     if rating >= 4.0 and review_count >= 50:
         score += 20
-        reasons.append(f"Strong reputation: {rating}★, {review_count} reviews (+20)")
+        reasons.append(f"Strong: {rating}★, {review_count} reviews (+20)")
     elif rating >= 3.5 and review_count >= 20:
         score += 14
-        reasons.append(f"Good reputation: {rating}★, {review_count} reviews (+14)")
+        reasons.append(f"Good: {rating}★, {review_count} reviews (+14)")
     elif rating >= 3.0 and review_count >= 5:
         score += 8
-        reasons.append(f"Moderate reputation: {rating}★, {review_count} reviews (+8)")
+        reasons.append(f"Moderate: {rating}★, {review_count} reviews (+8)")
     else:
         score += 2
-        reasons.append(f"Weak signals: {rating}★, {review_count} reviews (+2)")
+        reasons.append(f"Weak signals (+2)")
 
     # 4. Contact availability (0-20, penalty if none)
-    if _has_email and _has_phone:
+    if has_email_b and has_phone_b:
         score += 20
-        reasons.append("Full contact info: email + phone (+20)")
-    elif _has_email:
+        reasons.append("Full contact: email + phone (+20)")
+    elif has_email_b:
         score += 16
-        reasons.append("Email available (primary outreach channel) (+16)")
-    elif _has_phone:
+        reasons.append("Email available (+16)")
+    elif has_phone_b:
         score += 10
-        reasons.append("Phone only — WhatsApp outreach possible (+10)")
+        reasons.append("Phone only — WhatsApp possible (+10)")
     else:
         score -= 20
-        reasons.append("No contact info at all — critical gap (-20)")
+        reasons.append("No contact info — critical gap (-20)")
 
-    # 5. Relevance to campaign goal (0-20)
-    desc_lower = (website_description or "").lower()
-    goal_lower = campaign_goal.lower()
-    goal_keywords = [w for w in goal_lower.split() if len(w) > 4]
-    keyword_hits = sum(1 for kw in goal_keywords if kw in desc_lower)
-    if keyword_hits >= 3:
+    # 5. Campaign relevance (0-20)
+    desc = website_description.lower()
+    goal_kws = [w for w in (campaign_goal or "").lower().split() if len(w) > 4]
+    hits = sum(1 for kw in goal_kws if kw in desc)
+    if hits >= 3:
         score += 20
-        reasons.append(f"High campaign relevance: {keyword_hits} keyword matches in description (+20)")
-    elif keyword_hits >= 1:
+        reasons.append(f"High relevance: {hits} keyword matches (+20)")
+    elif hits >= 1:
         score += 12
-        reasons.append(f"Moderate relevance: {keyword_hits} keyword match(es) in description (+12)")
+        reasons.append(f"Moderate relevance: {hits} match(es) (+12)")
     elif website_description and len(website_description) > 30:
         score += 8
-        reasons.append("Has website content but low keyword overlap with campaign goal (+8)")
+        reasons.append("Has description but low keyword overlap (+8)")
     else:
         score += 3
-        reasons.append("Minimal description — hard to assess relevance (+3)")
+        reasons.append("Minimal description (+3)")
 
     score = max(0, min(100, score))
 
-    # Decision
     if score >= 80:
         decision, priority = "QUALIFIED", "HIGH"
     elif score >= 60:
@@ -150,16 +177,14 @@ def score_lead(
     else:
         decision, priority = "REJECTED", "NONE"
 
-    high_value = score >= 85 and review_count > 100 and _has_email
-    hv_note = "\n⭐ HIGH_VALUE — pause for human review before sending" if high_value else ""
-
-    reason_str = "\n".join(f"  {i+1}. {r}" for i, r in enumerate(reasons[:3]))
+    high_value = score >= 85 and review_count > 100 and has_email_b
+    hv = "\n⭐ HIGH_VALUE — flag for human review" if high_value else ""
 
     return (
-        f"SCORE: {score}/100 | DECISION: {decision} | PRIORITY: {priority}{hv_note}\n"
+        f"SCORE: {score}/100 | {decision} | {priority}{hv}\n"
         f"Lead: {lead_name} ({industry}, {city})\n"
-        f"Top reasons:\n{reason_str}\n"
-        f"Contact: email={'yes' if has_email else 'no'}, phone={'yes' if has_phone else 'no'}"
+        f"Reasons:\n" + "\n".join(f"  {i+1}. {r}" for i, r in enumerate(reasons[:3])) + "\n"
+        f"Contact: email={'yes' if has_email_b else 'no'}, phone={'yes' if has_phone_b else 'no'}"
     )
 
 
