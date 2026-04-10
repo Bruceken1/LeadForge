@@ -251,35 +251,41 @@ def _extract_content(msg: Any) -> str:
 
 def _parse_outreach_packages(messages: list) -> list[dict]:
     """
-    Parse outreach packages from the personalization agent's messages.
+    Parse outreach packages from the personalization agent messages.
     Handles both:
       - '=== OUTREACH PACKAGE ===' (prompt format)
-      - '=== OUTREACH: <NAME> ===' (what the LLM actually writes)
-    Does NOT require an email address — phone-only leads get WhatsApp outreach.
+      - '=== OUTREACH: <n> ===' (what the LLM actually writes)
+    Field names accept both underscore and space variants (EMAIL_SUBJECT / EMAIL SUBJECT).
+    All regexes are newline-independent — LLMs often put everything on one line.
     """
     packages = []
     full_text = ""
 
-    # Collect all personalization agent messages
     for msg in messages:
         name = getattr(msg, "name", "") or ""
         if "personalization" in name or "personalizer" in name:
             full_text += _extract_content(msg) + "\n"
 
-    # Fallback: scan all messages for anything containing outreach markers
     if not full_text:
         for msg in messages:
             content = _extract_content(msg)
-            if "EMAIL_SUBJECT" in content or "OUTREACH PACKAGE" in content or "OUTREACH:" in content:
+            if any(k in content for k in ("EMAIL_SUBJECT", "EMAIL SUBJECT", "OUTREACH PACKAGE", "OUTREACH:")):
                 full_text += content + "\n"
 
     if not full_text:
+        print("[parser] No personalization content found in messages")
         return []
 
-    # Split on either delimiter pattern the LLM uses
-    blocks = re.split(r"===\s*OUTREACH(?:\s*PACKAGE|\s*:[^=]+)?\s*===", full_text)
+    print(f"[parser] Parsing {len(full_text)} chars. Preview: {repr(full_text[:200])}")
 
-    for block in blocks[1:]:  # first element is text before first delimiter
+    blocks = re.split(r"===\s*OUTREACH(?:\s*PACKAGE|\s*:[^=]+)?\s*===", full_text)
+    print(f"[parser] {len(blocks)} blocks (expecting >1)")
+
+    # Lookahead: stop capture at any known next field keyword, or end of text
+    # Accepts both underscore and space variants (EMAIL_SUBJECT / EMAIL SUBJECT)
+    NEXT = r"(?=\s*(?:lead_id|\bname\b|email:|phone:|EMAIL[_ ]SUBJECT|EMAIL[_ ]BODY|WHATSAPP|FOLLOW[_ ]UP|===|$))"
+
+    for i, block in enumerate(blocks[1:], 1):
         if not block.strip():
             continue
 
@@ -290,24 +296,22 @@ def _parse_outreach_packages(messages: list) -> list[dict]:
             return m.group(1).strip() if m else default
 
         pkg["lead_id"]  = _field(r"lead_id[:\s]+(\S+)", block)
-        pkg["name"]     = _field(r"(?:^name|company)[:\s]+([^\n]{1,80})", block)
+        pkg["name"]     = _field(r"\bname[:\s]+([^\n|]{1,80})" + NEXT, block)
         pkg["email"]    = _field(r"email[:\s]+([\w.+-]+@[\w.-]+\.\w+)", block)
-        pkg["phone"]    = _field(r"phone[:\s]+([+\d][\d\s\-()]{5,20})", block)
-        pkg["subject"]  = _field(r"EMAIL_SUBJECT[:\s]+(.+?)(?:\n)", block)
-        pkg["body"]     = _field(r"EMAIL_BODY[:\s]*\n(.+?)(?:\nWHATSAPP|\nFOLLOW_UP|={3}|$)", block)
-        pkg["whatsapp"] = _field(r"WHATSAPP[:\s]*\n(.+?)(?:\nFOLLOW_UP|={3}|$)", block)
+        pkg["phone"]    = _field(r"phone[:\s]+([+\d][\d\s\-()+]{5,20})" + NEXT, block)
+        pkg["subject"]  = _field(r"EMAIL[_ ]SUBJECT[:\s]+(.+?)" + NEXT, block)
+        pkg["body"]     = _field(r"EMAIL[_ ]BODY[:\s]+(.+?)" + NEXT, block)
+        pkg["whatsapp"] = _field(r"WHATSAPP[:\s]+(.+?)" + NEXT, block)
 
-        # Accept package if it has email OR phone — either channel can be used
-        has_contact = (pkg.get("email") and "@" in pkg["email"]) or \
-                      (pkg.get("phone") and len(pkg["phone"].strip()) >= 6)
+        print(f"[parser] Block {i}: subject={repr(pkg['subject'][:50] if pkg['subject'] else None)} "
+              f"email={repr(pkg['email'])} phone={repr(pkg['phone'])}")
 
-        # Also accept if we have a subject/body even without confirmed contact
-        # (the executor will skip sending if truly no contact info)
-        has_content = pkg.get("subject") or pkg.get("body")
-
-        if has_contact or has_content:
+        if pkg.get("subject") or pkg.get("body") or pkg.get("whatsapp"):
             packages.append(pkg)
+        else:
+            print(f"[parser] Block {i} skipped — no subject, body, or whatsapp extracted")
 
+    print(f"[parser] Returning {len(packages)} packages")
     return packages
 
 
