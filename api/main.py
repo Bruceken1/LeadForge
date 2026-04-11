@@ -485,8 +485,9 @@ async def _background_run(run_id: str, body: RunRequest):
     try:
         configure_tools(body.leadengine_api_url, body.leadengine_token, body.org_id)
 
-        sender_email = os.environ.get("SENDER_EMAIL", "outreach@dime-solutions.co.ke")
-        sender_name  = os.environ.get("SENDER_NAME",  "Dimes Solutions")
+        sender_email  = os.environ.get("SENDER_EMAIL", "outreach@dime-solutions.co.ke")
+        sender_name   = os.environ.get("SENDER_NAME",  "Dimes Solutions")
+        loop_interval = max(60, getattr(body, "loop_interval", 60))
 
         agents = _agent_graph  # dict: {"research", "qualifier", "personalizer"}
 
@@ -500,97 +501,135 @@ async def _background_run(run_id: str, body: RunRequest):
         await _log(run_id, "supervisor", "started", {
             "goal": body.campaign_goal, "icp": body.icp.dict(),
         })
-        print(f"[{run_id}] Starting 3-step sequential pipeline")
+        print(f"[{run_id}] Starting continuous pipeline loop (interval: {loop_interval}s)")
 
-        all_messages = []
+        total_loops  = 0
+        total_emails = 0
+        total_wa     = 0
 
-        async def _run_agent(agent_key: str, agent_name: str, prompt: str) -> str:
-            """Invoke one agent, log its messages, return its final text output."""
-            agent = agents[agent_key]
-            config = {"configurable": {"thread_id": f"{run_id}-{agent_key}"}, "recursion_limit": 25}
+        while True:
+            # Check for cancellation before each loop
+            if _db_pool:
+                async with _db_pool.acquire() as conn:
+                    row = await conn.fetchrow(
+                        "SELECT status FROM agent_runs WHERE id=$1", run_id
+                    )
+                if row and row["status"] in ("cancelled", "failed"):
+                    await _log(run_id, "supervisor", "message",
+                               {"content": f"Session stopped. Loops: {total_loops}, emails: {total_emails}"})
+                    return
 
-            await _log(run_id, agent_name, "started", {"prompt_preview": prompt[:200]})
-            output_text = ""
+            total_loops += 1
+            all_messages = []
 
-            async for chunk in agent.astream(
-                {"messages": [{"role": "user", "content": prompt}]},
-                config=config,
-                stream_mode="updates",
-            ):
-                for node_name, node_output in chunk.items():
-                    if not isinstance(node_output, dict):
-                        continue
-                    msgs = node_output.get("messages", [])
-                    all_messages.extend(msgs)
-                    for msg in msgs:
-                        msg_type   = type(msg).__name__
-                        agent_label = (getattr(msg, "name", None) or node_name or agent_name).strip()
-                        content    = _extract_content(msg)
-                        if content:
-                            print(f"[{run_id}]  {agent_label}: {content[:150]!r}")
-                        if not content or msg_type == "HumanMessage":
+            await _log(run_id, "supervisor", "message", {
+                "content": f"Loop {total_loops} starting..."
+            })
+            print(f"[{run_id}] Loop {total_loops} starting")
+
+            async def _run_agent(agent_key: str, agent_name: str, prompt: str) -> str:
+                agent = agents[agent_key]
+                config = {
+                    "configurable": {"thread_id": f"{run_id}-{agent_key}-loop{total_loops}"},
+                    "recursion_limit": 25,
+                }
+                await _log(run_id, agent_name, "started", {"prompt_preview": prompt[:200]})
+                output_text = ""
+                async for chunk in agent.astream(
+                    {"messages": [{"role": "user", "content": prompt}]},
+                    config=config,
+                    stream_mode="updates",
+                ):
+                    for node_name, node_output in chunk.items():
+                        if not isinstance(node_output, dict):
                             continue
-                        event_type = (
-                            "tool_result" if msg_type == "ToolMessage"
-                            else "tool_call" if getattr(msg, "tool_calls", None)
-                            else "message"
-                        )
-                        await _log(run_id, agent_label, event_type, {"content": content[:2000]})
-                        if msg_type == "AIMessage" and not getattr(msg, "tool_calls", None):
-                            output_text = content  # last non-tool AI message = final answer
+                        msgs = node_output.get("messages", [])
+                        all_messages.extend(msgs)
+                        for msg in msgs:
+                            msg_type    = type(msg).__name__
+                            agent_label = (getattr(msg, "name", None) or node_name or agent_name).strip()
+                            content     = _extract_content(msg)
+                            if content:
+                                print(f"[{run_id}]  {agent_label}: {content[:150]!r}")
+                            if not content or msg_type == "HumanMessage":
+                                continue
+                            event_type = (
+                                "tool_result" if msg_type == "ToolMessage"
+                                else "tool_call" if getattr(msg, "tool_calls", None)
+                                else "message"
+                            )
+                            await _log(run_id, agent_label, event_type, {"content": content[:2000]})
+                            if msg_type == "AIMessage" and not getattr(msg, "tool_calls", None):
+                                output_text = content
+                return output_text
 
-            return output_text
-
-        # ── Step 1: Research ────────────────────────────────────────────────
-        research_prompt = (
-            f"{brief}\n\n"
-            f"Scrape Google Maps for '{body.icp.industry}' in '{body.icp.location}'. "
-            f"Find up to {body.max_leads} businesses. Enrich emails where possible. "
-            f"Return the RESEARCH REPORT."
-        )
-        research_report = await _run_agent("research", "research_agent", research_prompt)
-        print(f"[{run_id}] Research complete — {len(research_report)} chars")
-
-        # ── Step 2: Qualify ─────────────────────────────────────────────────
-        qualify_prompt = (
-            f"{brief}\n\n"
-            f"Here is the RESEARCH REPORT from the research agent:\n\n{research_report}\n\n"
-            f"Score every lead. Use score_lead() for each one. "
-            f"Return the QUALIFICATION SUMMARY with QUALIFIED LEAD DETAILS."
-        )
-        qualification_report = await _run_agent("qualifier", "qualifier_agent", qualify_prompt)
-        print(f"[{run_id}] Qualification complete — {len(qualification_report)} chars")
-
-        # ── Step 3: Personalize ─────────────────────────────────────────────
-        personalize_prompt = (
-            f"{brief}\n\n"
-            f"Here are the QUALIFIED LEADS from the qualifier:\n\n{qualification_report}\n\n"
-            f"Write personalized outreach for every QUALIFIED lead. "
-            f"Use generate_outreach_brief() and get_local_context() for each. "
-            f"Return all OUTREACH PACKAGES in the exact format specified."
-        )
-        personalization_report = await _run_agent("personalizer", "personalization_agent", personalize_prompt)
-        print(f"[{run_id}] Personalization complete — {len(personalization_report)} chars")
-
-        await _log(run_id, "supervisor", "message", {"content": "3-step pipeline complete. Parsing outreach packages."})
-
-        # ── Execute outreach ─────────────────────────────────────────────────
-        packages = _parse_outreach_packages(all_messages)
-        print(f"[{run_id}] Found {len(packages)} outreach packages to send")
-
-        if packages:
-            emails_sent, wa_sent = await _execute_outreach(
-                run_id, packages, sender_email, sender_name
+            # Step 1: Research
+            research_prompt = (
+                f"{brief}\n\n"
+                f"Scrape Google Maps for '{body.icp.industry}' in '{body.icp.location}'. "
+                f"Find up to {body.max_leads} businesses. Enrich emails where possible. "
+                f"Return the RESEARCH REPORT. "
+                f"IMPORTANT: Do NOT call filter_leads_by_icp — scrape results are already ICP-matched."
             )
-        else:
-            emails_sent, wa_sent = 0, 0
-            await _log(run_id, "executor_agent", "message",
-                       {"content": "No outreach packages found to send."})
+            research_report = await _run_agent("research", "research_agent", research_prompt)
+            print(f"[{run_id}] Loop {total_loops} research done — {len(research_report)} chars")
 
-        await _set_status(run_id, "completed")
-        await _log(run_id, "supervisor", "completed", {
-            "message": f"Pipeline complete. Emails: {emails_sent}, WhatsApp: {wa_sent}"
-        })
+            # Step 2: Qualify
+            qualify_prompt = (
+                f"{brief}\n\n"
+                f"Here is the RESEARCH REPORT:\n\n{research_report}\n\n"
+                f"Score every lead using score_lead(). Return the QUALIFICATION SUMMARY."
+            )
+            qualification_report = await _run_agent("qualifier", "qualifier_agent", qualify_prompt)
+            print(f"[{run_id}] Loop {total_loops} qualification done — {len(qualification_report)} chars")
+
+            # Step 3: Personalize
+            personalize_prompt = (
+                f"{brief}\n\n"
+                f"Here are the QUALIFIED LEADS:\n\n{qualification_report}\n\n"
+                f"Write personalized outreach for every QUALIFIED lead and return all OUTREACH PACKAGES."
+            )
+            personalization_report = await _run_agent("personalizer", "personalization_agent", personalize_prompt)
+            print(f"[{run_id}] Loop {total_loops} personalization done — {len(personalization_report)} chars")
+
+            # Execute outreach
+            packages = _parse_outreach_packages(all_messages)
+            print(f"[{run_id}] Loop {total_loops}: {len(packages)} packages")
+
+            if packages:
+                emails_sent, wa_sent = await _execute_outreach(
+                    run_id, packages, sender_email, sender_name
+                )
+                total_emails += emails_sent
+                total_wa     += wa_sent
+            else:
+                emails_sent, wa_sent = 0, 0
+                await _log(run_id, "executor_agent", "message",
+                           {"content": f"Loop {total_loops}: no outreach packages found."})
+
+            # Persist running totals
+            if _db_pool:
+                async with _db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE agent_runs SET sent=$1, updated_at=NOW() WHERE id=$2",
+                        total_emails, run_id,
+                    )
+
+            await _log(run_id, "supervisor", "message", {
+                "content": (
+                    f"Loop {total_loops} complete. "
+                    f"Emails this loop: {emails_sent}. "
+                    f"Total emails sent: {total_emails}. "
+                    f"Next loop in {loop_interval}s..."
+                )
+            })
+            print(f"[{run_id}] Loop {total_loops} done. Sleeping {loop_interval}s...")
+            await asyncio.sleep(loop_interval)
+
+    except asyncio.CancelledError:
+        await _set_status(run_id, "cancelled")
+        await _log(run_id, "supervisor", "message",
+                   {"content": f"Campaign cancelled after {total_loops} loops, {total_emails} emails sent."})
 
     except Exception as e:
         import traceback
@@ -602,33 +641,6 @@ async def _background_run(run_id: str, body: RunRequest):
         })
 
 
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  AUTONOMOUS SDR DASHBOARD ROUTES
-#  These power the /autonomous tab in the frontend.
-# ═══════════════════════════════════════════════════════════════════
-
-class ICPConfigRequest(BaseModel):
-    org_id:         str
-    org_name:       str = ""
-    industry:       str
-    location:       str
-    min_rating:     float = 3.5
-    min_reviews:    int   = 5
-    campaign_goal:  str   = ""
-    max_leads:      int   = 20
-
-class ApprovalActionRequest(BaseModel):
-    approval_id: int
-    action:      str
-    notes:       str = ""
-    resolved_by: str = "human"
-
-class OptOutRequest(BaseModel):
-    email:  str
-    reason: str = "manual_request"
-    source: str = "dashboard"
 
 
 @app.post("/api/icp")
