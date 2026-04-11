@@ -643,6 +643,28 @@ async def _background_run(run_id: str, body: RunRequest):
 
 
 
+class ICPConfigRequest(BaseModel):
+    org_id:         str
+    org_name:       str = ""
+    industry:       str
+    location:       str
+    min_rating:     float = 3.5
+    min_reviews:    int   = 5
+    campaign_goal:  str   = ""
+    max_leads:      int   = 20
+
+class ApprovalActionRequest(BaseModel):
+    approval_id: int
+    action:      str
+    notes:       str = ""
+    resolved_by: str = "human"
+
+class OptOutRequest(BaseModel):
+    email:  str
+    reason: str = "manual_request"
+    source: str = "dashboard"
+
+
 @app.post("/api/icp")
 async def create_icp(body: ICPConfigRequest):
     async with _db_pool.acquire() as conn:
